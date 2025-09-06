@@ -243,29 +243,38 @@ bot.hears('⚙️ Strategy', async (ctx) => {
 
 bot.hears('📊 Show Tokens', async (ctx) => {
   console.log(`[📊 Show Tokens] User: ${String(ctx.from?.id)}`);
-  // Invoke same behavior as /show_token for a fast preview
+  // Use the sequential listener's per-user collector to return an authoritative merged payload.
   try {
-    // Delegate to the existing command handler by calling the logic inline
     const userId = String(ctx.from?.id);
-    const user = users[userId];
-    if (!user || !user.strategy || user.strategy.enabled === false) {
-      try { await ctx.reply('🔎 Showing latest live mints (you have no strategy set). Use /strategy to configure filters.'); } catch(e){}
+    const user = users[userId] || {};
+    // Build options for collector from user's strategy
+    const maxCollect = Math.max(1, Number(user.strategy?.maxTrades || 3));
+    const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
+    // Require the sequential listener module and its per-user helper
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const seq = require('./scripts/sequential_10s_per_program.js');
+    if (!seq || typeof seq.collectFreshMintsPerUser !== 'function') {
+      await ctx.reply('⚠️ Live listener not available right now; please try again later.');
+      return;
     }
-    // reuse getTokensForUser to fetch listener candidates
-    const strategyRef = (user && user.strategy) ? user.strategy : {};
-    const tokens = await getTokensForUser(userId, strategyRef).catch(()=>[]);
-    if (!tokens || tokens.length === 0) {
+    // Run a single collection pass and get the merged payload for this user only
+    const usersObj: Record<string, any> = {};
+    usersObj[userId] = user;
+    const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect, timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride }).catch(() => ({}));
+    const payload = collected && collected[userId] ? collected[userId] : null;
+    if (!payload || !Array.isArray(payload.tokens) || payload.tokens.length === 0) {
       await ctx.reply('No live tokens found right now. Try again in a few seconds.');
       return;
     }
-    // build a richer per-token preview using buildPreviewMessage
-    let text = `🔔 <b>Live tokens (preview)</b>\nFound ${tokens.length} candidates:\n`;
-    for (const t of tokens.slice(0, Math.max(1, Number(strategyRef?.maxTrades || 3)))) {
+    // Render the merged tokens payload (up to user's maxTrades)
+    const tokens = payload.tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
+    let text = `🔔 <b>Live tokens (listener)</b>\nFound ${payload.tokens.length} candidate(s) (showing ${tokens.length}):\n`;
+    for (const t of tokens) {
       try {
-  const preview = buildPreviewMessage(t);
-  const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
-  text += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
-  try{ if(t && (t.sourceProgram || t.sourceSignature)){ text += `<i>من البرنامج: ${t.sourceProgram || '-'} sig: ${t.sourceSignature || '-'}</i>\n`; } }catch(e){}
+        const preview = buildPreviewMessage(t);
+        const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
+        text += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+        try{ if(t && (t.sourceProgram || t.sourceSignature)){ text += `<i>من البرنامج: ${t.sourceProgram || '-'} sig: ${t.sourceSignature || '-'}</i>\n`; } }catch(e){}
       } catch (e) {
         const addr = t && (t.tokenAddress || t.address || t.mint) || 'unknown';
         text += `• <code>${addr}</code>\n`;
@@ -273,6 +282,7 @@ bot.hears('📊 Show Tokens', async (ctx) => {
     }
     await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true } as any));
   } catch (e) {
+    console.error('[show_tokens] error', e && (e.message || e));
     try { await ctx.reply('Error fetching live tokens.'); } catch(_){}
   }
 });

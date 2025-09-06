@@ -82,20 +82,21 @@ const ALWAYS_PROCESS_KINDS = new Set(['initialize']);
 const DENY = new Set(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v','Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB','So11111111111111111111111111111111111111112','TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA']);
 
 // Configurable timings (ms) via environment variables
-const PER_PROGRAM_DURATION_MS = Number(process.env.PER_PROGRAM_DURATION_MS) || 10000;
+const PER_PROGRAM_DURATION_MS = Number(process.env.PER_PROGRAM_DURATION_MS) || 20000;
 const INNER_SLEEP_MS = Number(process.env.INNER_SLEEP_MS) || 180;
 const POLL_SLEEP_MS = Number(process.env.POLL_SLEEP_MS) || 800;
 const CYCLE_SLEEP_MS = Number(process.env.CYCLE_SLEEP_MS) || 2500;
 // Increase defaults during testing to avoid overly-strict rejection of valid mints
-const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 20;
+const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 32;
 // raise default to allow checking a few historical signatures for accuracy
-const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 12;
+const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 24;
 // Freshness and first-signature matching configuration
 // Proposal 1: widen default window slightly to capture marginally delayed mints
-const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 2; // seconds
+// default max mint age (seconds) when not provided via env
+const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 3; // seconds
 // Collector: allow accumulating a small number of freshly-accepted mints and
 // printing them as a single JSON array. Useful for short-lived runs/testing.
-const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 3;
+const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 10;
 const EXIT_ON_COLLECT = (process.env.EXIT_ON_COLLECT === 'false') ? false : true;
 const LATEST_COLLECTED = [];
 // Capture-only mode: when true the listener writes a minimal capture JSON to disk
@@ -200,8 +201,8 @@ async function heliusRpc(method, params){
 const HELIUS_TX_OPTS = { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 };
 
 // Concurrency and retry tuning for getTransaction calls
-const TX_CONCURRENCY = Number(process.env.TX_CONCURRENCY) || 10;
-const MAX_TX_RETRIES = Number(process.env.MAX_TX_RETRIES) || 2;
+const TX_CONCURRENCY = Number(process.env.TX_CONCURRENCY) || 5;
+const MAX_TX_RETRIES = Number(process.env.MAX_TX_RETRIES) || 3;
 const TX_RETRY_BASE_MS = Number(process.env.TX_RETRY_BASE_MS) || 150;
 
 // simple semaphore for limiting concurrent getTransaction calls
@@ -256,9 +257,16 @@ function joinTxLogs(tx){
 // otherwise fall back to transaction block time. Returns null when neither is present.
 function getCanonicalAgeSeconds(firstBlockTime, txBlockTime){
   try{
-    const now = Date.now();
-  if(firstBlockTime) return (now - (Number(firstBlockTime) * 1000)) / 1000;
-  if(txBlockTime) return (now - (Number(txBlockTime) * 1000)) / 1000;
+  const now = Date.now();
+  // Normalize inputs: block times may be in seconds (most cases) or already ms
+  const fb = firstBlockTime ? Number(firstBlockTime) : null;
+  const tb = txBlockTime ? Number(txBlockTime) : null;
+  // Convert seconds to ms when values look like epoch seconds (reasonable threshold)
+  const toMs = v => (v && v < 1e12) ? v * 1000 : v;
+  const fbMs = fb ? toMs(fb) : null;
+  const tbMs = tb ? toMs(tb) : null;
+  const useMs = (fbMs && tbMs) ? Math.max(fbMs, tbMs) : (fbMs || tbMs || null);
+  if(useMs) return (now - useMs) / 1000;
   }catch(e){}
   return null;
 }
@@ -576,16 +584,21 @@ async function startSequentialListener(options){
                 // include listener source metadata so strategy filters can preserve/inspect realtime origin
                 const tok = { address: mintAddr, tokenAddress: mintAddr, mint: mintAddr, sourceProgram: p, sourceSignature: sig, sampleLogs: (tx.meta&&tx.meta.logMessages||[]).slice(0,10), sourceCandidates: true };
                 try{
-                  // Lightweight on-chain first-signature probe to compute freshness only
+                  // Compute a deterministic age for the token using cached first-signature probe
                   try{
-                    const sigs = await heliusRpc('getSignaturesForAddress', [mintAddr, { limit: 1 }]);
-                    if (Array.isArray(sigs) && sigs.length > 0) {
-                      const s0 = sigs[0];
-                      const bt = s0.blockTime || s0.block_time || s0.blocktime || null;
-                      if (bt) {
-                        try { tok.freshnessDetails = { firstTxMs: Number(bt) * 1000 }; } catch(e){}
-                        try { tok._canonicalAgeSeconds = getCanonicalAgeSeconds(bt, null); } catch(e){}
-                      }
+                    const first = await getFirstSignatureCached(mintAddr).catch(()=>null);
+                    const ft = first && first.blockTime ? first.blockTime : null;
+                    if(ft){
+                      // store ms epoch for downstream consumers
+                      try{ tok.firstBlockTime = Number(ft) * 1000; }catch(e){}
+                      try{ tok.freshnessDetails = { firstTxMs: Number(ft) * 1000 }; }catch(e){}
+                      try{ tok._canonicalAgeSeconds = getCanonicalAgeSeconds(ft, txBlock); }catch(e){}
+                    } else if(txBlock){
+                      // fallback: use the current tx's block time to estimate age when first-sig missing
+                      try{ tok.firstBlockTime = null; }catch(e){}
+                      try{ tok._canonicalAgeSeconds = getCanonicalAgeSeconds(null, txBlock); }catch(e){}
+                    } else {
+                      try{ tok.firstBlockTime = null; }catch(e){}
                     }
                   }catch(e){}
                 }catch(e){}
@@ -630,9 +643,29 @@ async function startSequentialListener(options){
             }
           }catch(e){ matched = []; }
                   if(Array.isArray(matched) && matched.length > 0){
-                    const matchAddrs = matched.map(t => t.address || t.tokenAddress || t.mint).slice(0,5);
-                    const userEvent = { time:new Date().toISOString(), program:p, signature:sig, user: uid, matched: matchAddrs, kind: kind, candidateTokens: candidateTokens.slice(0,10) };
-                    // Detailed log for matches
+                    // Per-user age cutoff: interpret user.strategy.minAge as max allowed age (seconds)
+                    const userMinAgeRaw = user && user.strategy ? user.strategy.minAge : undefined;
+                    const userMinAge = (userMinAgeRaw !== undefined && userMinAgeRaw !== null && !isNaN(Number(userMinAgeRaw))) ? Number(userMinAgeRaw) : null;
+
+                    // Filter matched tokens by per-user age threshold when available
+                    const matchedFiltered = matched.filter(tok => {
+                      try{
+                        const age = (tok && tok._canonicalAgeSeconds != null) ? Number(tok._canonicalAgeSeconds) : (tok && tok.freshnessDetails && tok.freshnessDetails.firstTxMs ? getCanonicalAgeSeconds(Number(tok.freshnessDetails.firstTxMs) / 1000, null) : null);
+                        if(userMinAge !== null){
+                          return (age !== null && !isNaN(age) && age <= userMinAge);
+                        }
+                        return true;
+                      }catch(e){ return false; }
+                    });
+
+                    if(!Array.isArray(matchedFiltered) || matchedFiltered.length === 0) {
+                      // nothing left after per-user filtering
+                      continue;
+                    }
+
+                    // Merge matched tokens into a single compact payload (up to 10 tokens)
+                    const matchAddrs = matchedFiltered.map(t => t.address || t.tokenAddress || t.mint).slice(0,10);
+                    const userEvent = { time:new Date().toISOString(), program:p, signature:sig, user: uid, matched: matchAddrs, kind: kind, candidateTokens: matchedFiltered.slice(0,10) };
                     console.error('MATCH', JSON.stringify(userEvent));
                     // Build a Telegram-ready payload using tokenUtils if available
                     let payload = { time: userEvent.time, program: p, signature: sig, matched: matchAddrs, tokens: userEvent.candidateTokens };
@@ -738,7 +771,7 @@ module.exports.startSequentialListener = startSequentialListener;
 // Lightweight one-shot collector: run the minimal discovery loop until we collect
 // `maxCollect` fresh mints or `timeoutMs` elapses. Returns an array of mint addresses.
 // Collector: try to give enough time to iterate all configured programs by default
-async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || Math.max(20000, PER_PROGRAM_DURATION_MS * (PROGRAMS.length || 1) + 5000)), maxAgeSec = undefined, strictOverride = undefined } = {}){
+async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || Math.max(20000, PER_PROGRAM_DURATION_MS * (PROGRAMS.length || 1) + 5000)), maxAgeSec = undefined, strictOverride = false } = {}){
   const collected = [];
   const seenMintsLocal = new Set();
   const stopAt = Date.now() + (Number(timeoutMs) || 20000);
@@ -917,6 +950,31 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
   return Array.from(new Set(collected)).slice(0, maxCollect);
 }
 module.exports.collectFreshMints = collectFreshMints;
+// Helper: collect once and return per-user merged payloads filtered by each user's strategy
+async function collectFreshMintsPerUser(usersObj = {}, { maxCollect = 10, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || 20000), strictOverride = false } = {}){
+  // Run a single collector pass (no global maxAgeSec) to gather candidates with ages
+  const collected = await collectFreshMints({ maxCollect, timeoutMs, maxAgeSec: undefined, strictOverride });
+  const result = {};
+  for(const uid of Object.keys(usersObj || {})){
+    try{
+      const user = usersObj[uid] || {};
+      const userMinAgeRaw = user && user.strategy ? user.strategy.minAge : undefined;
+      const userMinAge = (userMinAgeRaw !== undefined && userMinAgeRaw !== null && !Number.isNaN(Number(userMinAgeRaw))) ? Number(userMinAgeRaw) : null;
+      const tokens = (Array.isArray(collected) ? collected : []).filter(t => {
+        try{
+          const age = (t && t._canonicalAgeSeconds != null) ? Number(t._canonicalAgeSeconds) : null;
+          if(userMinAge !== null){
+            return (age !== null && !isNaN(age) && age <= userMinAge);
+          }
+          return true;
+        }catch(e){ return false; }
+      }).slice(0, 10);
+      result[uid] = { user: String(uid), matched: tokens.map(t => t.mint), tokens };
+    }catch(e){ result[uid] = { user: String(uid), matched: [], tokens: [] }; }
+  }
+  return result;
+}
+module.exports.collectFreshMintsPerUser = collectFreshMintsPerUser;
 // If script is executed directly, run immediately (CLI usage preserved)
 if (require.main === module) {
   startSequentialListener().catch(e => { console.error('Listener failed:', e && e.message || e); process.exit(1); });
