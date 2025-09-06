@@ -107,7 +107,7 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
     const seq = require('./scripts/sequential_10s_per_program.js');
     if (!seq || typeof seq.collectFreshMints !== 'function') return [];
   const strictOverride = (strategy && (strategy as any).collectorStrict !== undefined) ? Boolean((strategy as any).collectorStrict) : undefined;
-  const items = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(() => []);
+  const items = await seq.collectFreshMints({ maxCollect, maxAgeSec, strictOverride }).catch(() => []);
     if (!Array.isArray(items) || items.length === 0) return [];
     const tokens = (items || []).map((it: any) => {
       if (!it) return null;
@@ -262,9 +262,10 @@ bot.hears('📊 Show Tokens', async (ctx) => {
     let text = `🔔 <b>Live tokens (preview)</b>\nFound ${tokens.length} candidates:\n`;
     for (const t of tokens.slice(0, Math.max(1, Number(strategyRef?.maxTrades || 3)))) {
       try {
-        const preview = buildPreviewMessage(t);
-        const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
-        text += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+  const preview = buildPreviewMessage(t);
+  const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
+  text += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+  try{ if(t && (t.sourceProgram || t.sourceSignature)){ text += `<i>من البرنامج: ${t.sourceProgram || '-'} sig: ${t.sourceSignature || '-'}</i>\n`; } }catch(e){}
       } catch (e) {
         const addr = t && (t.tokenAddress || t.address || t.mint) || 'unknown';
         text += `• <code>${addr}</code>\n`;
@@ -780,7 +781,7 @@ bot.command('show_token', async (ctx) => {
             }
           }catch(e){}
           const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-          const addrs = await seq.collectFreshMints({ maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
+          const addrs = await seq.collectFreshMints({ maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), maxAgeSec, strictOverride }).catch(()=>[]);
           tokens = (addrs || []).map((a:any)=>({ tokenAddress: a, address: a, mint: a, sourceCandidates: true, __listenerCollected: true }));
         }
       }catch(e){ listenerAvailable = false; }
@@ -843,7 +844,7 @@ bot.command('show_token', async (ctx) => {
         const maxShow = Math.min(maxTrades, 10, tokens.length);
         let msg = `✅ Live listener-only results: <b>${tokens.length}</b> token(s) available (showing up to ${maxShow}):\n`;
         for (const t of tokens.slice(0, maxShow)) {
-          try { const preview = buildPreviewMessage(t); const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`; } catch (e) { const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<code>${addr}</code>\n`; }
+    try { const preview = buildPreviewMessage(t); const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`; try{ if(t && (t.sourceProgram || t.sourceSignature)) msg += `<i>من البرنامج: ${t.sourceProgram || '-'} sig: ${t.sourceSignature || '-'}</i>\n`; }catch(e){} } catch (e) { const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<code>${addr}</code>\n`; }
         }
         try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch(e) { try { await ctx.reply('✅ Found live listener-only tokens.'); } catch(_){} }
         return;
@@ -854,9 +855,16 @@ bot.command('show_token', async (ctx) => {
         if(seq && typeof seq.collectFreshMints === 'function'){
           const maxCollect = Math.max(1, Number(user.strategy?.maxTrades || 3));
           let maxAgeSec: number | undefined = undefined;
-          try{ const ma = user.strategy && (user.strategy as any).minAge; if(ma !== undefined && ma !== null){ const s = String(ma).trim().toLowerCase(); const secMatch = s.match(/^([0-9]+)s$/); const minMatch = s.match(/^([0-9]+)m$/); if(secMatch) maxAgeSec = Number(secMatch[1]); else if(minMatch) maxAgeSec = Number(minMatch[1]) * 60; else if(!isNaN(Number(s))){ const n = Number(s); maxAgeSec = n <= 2 ? n : n * 60; } } }catch(e){}
+          try{
+            const parseDuration = require('./src/utils/tokenUtils').parseDuration;
+            const ma = user.strategy && (user.strategy as any).minAge;
+            if(ma !== undefined && ma !== null){
+              const parsed = parseDuration(ma);
+              if(!isNaN(Number(parsed)) && parsed !== undefined && parsed !== null) maxAgeSec = Number(parsed);
+            }
+          }catch(e){}
           const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-          const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
+          const addrs = await seq.collectFreshMints({ maxCollect, maxAgeSec, strictOverride }).catch(()=>[]);
           if(Array.isArray(addrs) && addrs.length > 0){ try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} } return; }
         }
       }catch(e){}
@@ -885,18 +893,15 @@ bot.command('show_token', async (ctx) => {
           // derive maxAgeSec from user's minAge
           let maxAgeSec: number | undefined = undefined;
           try{
+            const parseDuration = require('./src/utils/tokenUtils').parseDuration;
             const ma = user.strategy && (user.strategy as any).minAge;
             if(ma !== undefined && ma !== null){
-              const s = String(ma).trim().toLowerCase();
-              const secMatch = s.match(/^([0-9]+)s$/);
-              const minMatch = s.match(/^([0-9]+)m$/);
-              if(secMatch) maxAgeSec = Number(secMatch[1]);
-              else if(minMatch) maxAgeSec = Number(minMatch[1]) * 60;
-              else if(!isNaN(Number(s))){ const n = Number(s); maxAgeSec = n <= 2 ? n : n * 60; }
+              const parsed = parseDuration(ma);
+              if(!isNaN(Number(parsed)) && parsed !== undefined && parsed !== null) maxAgeSec = Number(parsed);
             }
           }catch(e){}
           const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-          const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
+          const addrs = await seq.collectFreshMints({ maxCollect, maxAgeSec, strictOverride }).catch(()=>[]);
           if(Array.isArray(addrs) && addrs.length > 0){
             // Return raw payload so user sees actual live mints discovered
             try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} }
@@ -915,9 +920,10 @@ bot.command('show_token', async (ctx) => {
     let msg = `✅ Accurate results: <b>${accurate.length}</b> token(s) match your strategy (showing up to ${maxShow}):\n`;
     for (const t of accurate.slice(0, maxShow)) {
       try {
-        const preview = buildPreviewMessage(t);
+  const preview = buildPreviewMessage(t);
         const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
-        msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+  msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+  try{ if(t && (t.sourceProgram || t.sourceSignature)) msg += `<i>من البرنامج: ${t.sourceProgram || '-'} sig: ${t.sourceSignature || '-'}</i>\n`; }catch(e){}
       } catch (e) {
         const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
         msg += `\n<code>${addr}</code>\n`;

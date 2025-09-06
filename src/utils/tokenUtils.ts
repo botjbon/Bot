@@ -223,7 +223,7 @@ export function parseDuration(v: string | number | undefined | null): number | u
   const match = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*(s|sec|secs|seconds|m|min|mins|minutes|h|hr|hrs|hours|d|day|days)?$/);
   if (!match) return undefined;
   const n = Number(match[1]);
-  const unit = match[2] || 'm';
+  const unit = match[2] || 's';
   switch (unit) {
     case 's': case 'sec': case 'secs': case 'seconds': return Math.floor(n);
     case 'm': case 'min': case 'mins': case 'minutes': return Math.floor(n * 60);

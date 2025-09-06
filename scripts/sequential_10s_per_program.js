@@ -83,13 +83,13 @@ const DENY = new Set(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v','Es9vMFrzaC
 
 // Configurable timings (ms) via environment variables
 const PER_PROGRAM_DURATION_MS = Number(process.env.PER_PROGRAM_DURATION_MS) || 10000;
-const INNER_SLEEP_MS = Number(process.env.INNER_SLEEP_MS) || 120;
+const INNER_SLEEP_MS = Number(process.env.INNER_SLEEP_MS) || 180;
 const POLL_SLEEP_MS = Number(process.env.POLL_SLEEP_MS) || 800;
-const CYCLE_SLEEP_MS = Number(process.env.CYCLE_SLEEP_MS) || 2000;
+const CYCLE_SLEEP_MS = Number(process.env.CYCLE_SLEEP_MS) || 2500;
 // Increase defaults during testing to avoid overly-strict rejection of valid mints
 const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 20;
 // raise default to allow checking a few historical signatures for accuracy
-const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 8;
+const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 12;
 // Freshness and first-signature matching configuration
 // Proposal 1: widen default window slightly to capture marginally delayed mints
 const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 2; // seconds
@@ -114,7 +114,7 @@ function computeFirstSigTTL(){
     return Math.max(1000, Math.floor(base * multiplier));
   }catch(e){ return FIRST_SIG_TTL_MS; }
 }
-const FIRST_SIG_MATCH_WINDOW_SECS = Number(process.env.FIRST_SIG_MATCH_WINDOW_SECS) || 3; // allowed delta between firstSig.blockTime and tx.blockTime
+const FIRST_SIG_MATCH_WINDOW_SECS = Number(process.env.FIRST_SIG_MATCH_WINDOW_SECS) || 6; // allowed delta between firstSig.blockTime and tx.blockTime
 const FIRST_SIG_CACHE = new Map(); // mint -> { sig, blockTime, ts }
 
 async function getFirstSignatureCached(mint){
@@ -352,6 +352,13 @@ async function startSequentialListener(options){
     try{ const usersRaw = fs.readFileSync(usersPath, 'utf8'); users = usersRaw ? JSON.parse(usersRaw) : {}; }catch(e){ users = {}; }
   };
   loadUsers();
+  // Normalize strategy objects (ensure minAge is stored as seconds etc.)
+  try{
+    const normalize = require('../src/utils/strategyNormalizer').normalizeStrategy;
+    for(const k of Object.keys(users || {})){
+      try{ if(users[k] && users[k].strategy) users[k].strategy = normalize(users[k].strategy); }catch(e){}
+    }
+  }catch(e){}
   try{ fs.watchFile(usersPath, { interval: 2000 }, () => { loadUsers(); console.error('users.json reloaded'); }); }catch(e){}
   // require strategy filter once to avoid repeated module resolution cost
   let strategyFilter = null;
@@ -366,7 +373,8 @@ async function startSequentialListener(options){
       try{
         const rule = RULES[p] || RULES.default;
         console.error(`[${p}] listening (10s)`);
-        const end = Date.now()+10000;
+  // use configured per-program duration so the listener respects PER_PROGRAM_DURATION_MS
+  const end = Date.now() + (Number(process.env.PER_PROGRAM_DURATION_MS) || PER_PROGRAM_DURATION_MS);
         const seenTxs = new Set();
     while(Date.now()<end){
           if (stopped) break;
@@ -425,20 +433,48 @@ async function startSequentialListener(options){
                 if(kind === 'initialize'){
                   accept = true;
                 } else if(kind === 'swap'){
-                  // 2) For swaps: accept only if this tx is the mint's first signature AND the firstSig's blockTime
-                  //    is close to txBlock (within FIRST_SIG_MATCH_WINDOW_SECS) and within MAX_MINT_AGE_SECS
+                  // 2) For swaps: by default accept only if this tx is the mint's first signature
+                  //    AND the firstSig's blockTime is close to txBlock (within FIRST_SIG_MATCH_WINDOW_SECS).
+                  //    Optionally allow accepting non-first-sig swap mints when the environment flag
+                  //    ALLOW_NON_FIRST_SWAP=true is set. In that case we accept when the tx
+                  //    explicitly references the mint (parsed info) or the mint appears created here
+                  //    and the mint was not previously seen.
                   try{
                     const first = await getFirstSignatureCached(m);
                     if(first && first.sig && first.sig === sig){
                       const ft = first.blockTime || null;
                       if(ft && txBlock){
                         const delta = Math.abs(Number(ft) - Number(txBlock));
-                        // If the first-signature matches and timing is close, accept the mint as a candidate
-                        // and defer strict age-based decisions to per-user strategy filters (user.strategy.minAge).
                         if(delta <= FIRST_SIG_MATCH_WINDOW_SECS){
                           accept = true;
                         }
                       }
+                    } else {
+                      // optional relaxed acceptance for non-first-sig swaps
+                      try{
+                        const allowNonFirst = String(process.env.ALLOW_NON_FIRST_SWAP || 'false').toLowerCase() === 'true';
+                        if(allowNonFirst){
+                          // check whether tx explicitly references the mint in parsed instrs
+                          const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
+                          const instrs = (msg && msg.instructions) || [];
+                          let referencesFresh = false;
+                          for(const ins of instrs){
+                            try{
+                              const info = ins.parsed && ins.parsed.info;
+                              if(info){
+                                if(info.mint && String(info.mint) === String(m)) referencesFresh = true;
+                                if(info.source && String(info.source) === String(m)) referencesFresh = true;
+                                if(info.destination && String(info.destination) === String(m)) referencesFresh = true;
+                              }
+                            }catch(e){}
+                          }
+                          const createdHere = isMintCreatedInThisTx(tx, m);
+                          const prev = await mintPreviouslySeen(m, txBlock, sig).catch(() => true);
+                          if((referencesFresh || createdHere) && prev === false){
+                            accept = true;
+                          }
+                        }
+                      }catch(e){}
                     }
                   }catch(e){ /* ignore */ }
                 } else {
@@ -701,7 +737,8 @@ async function startSequentialListener(options){
 module.exports.startSequentialListener = startSequentialListener;
 // Lightweight one-shot collector: run the minimal discovery loop until we collect
 // `maxCollect` fresh mints or `timeoutMs` elapses. Returns an array of mint addresses.
-async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec = undefined, strictOverride = undefined } = {}){
+// Collector: try to give enough time to iterate all configured programs by default
+async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || Math.max(20000, PER_PROGRAM_DURATION_MS * (PROGRAMS.length || 1) + 5000)), maxAgeSec = undefined, strictOverride = undefined } = {}){
   const collected = [];
   const seenMintsLocal = new Set();
   const stopAt = Date.now() + (Number(timeoutMs) || 20000);
@@ -784,6 +821,29 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
                             }
                       }
                   }
+                }
+              }catch(e){}
+              // If first-signature didn't match, support optional relaxed acceptance via env
+              try{
+                const allowNonFirst = String(process.env.ALLOW_NON_FIRST_SWAP || 'false').toLowerCase() === 'true';
+                if(!accept && allowNonFirst){
+                  // check parsed instruction references or creation heuristics and ensure mint not previously seen
+                  const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
+                  const instrs = (msg && msg.instructions) || [];
+                  let referencesFresh = false;
+                  for(const ins of instrs){
+                    try{
+                      const info = ins.parsed && ins.parsed.info;
+                      if(info){
+                        if(info.mint && String(info.mint) === String(m)) referencesFresh = true;
+                        if(info.source && String(info.source) === String(m)) referencesFresh = true;
+                        if(info.destination && String(info.destination) === String(m)) referencesFresh = true;
+                      }
+                    }catch(e){}
+                  }
+                  const createdHere = isMintCreatedInThisTx(tx, m);
+                  const prev = await mintPreviouslySeen(m, txBlock, sig).catch(() => true);
+                  if((referencesFresh || createdHere) && prev === false) accept = true;
                 }
               }catch(e){}
             } else {

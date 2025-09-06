@@ -528,16 +528,16 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
           ageSeconds = (Date.now() - ageVal) / 1000;
         } else if (ageVal > 1e9) { // s timestamp
           ageSeconds = (Date.now() - ageVal * 1000) / 1000;
-        } else {
-          // treat as minutes
-          ageSeconds = Number(ageVal) * 60;
+      } else {
+        // treat plain numeric age values as seconds (consistent input semantics)
+        ageSeconds = Number(ageVal);
         }
       } else if (typeof ageVal === 'string') {
         // try numeric string
         const n = Number(ageVal);
         if (!isNaN(n)) {
           if (n > 1e9) ageSeconds = (Date.now() - n * 1000) / 1000;
-          else ageSeconds = n * 60;
+          else ageSeconds = n; // numeric string treated as seconds
         } else {
           // try duration parse (parseDuration returns seconds)
           const parsed = parseDuration(ageVal);
