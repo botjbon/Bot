@@ -35,7 +35,7 @@ async function processOne(file){
     const obj = JSON.parse(raw);
     const { mints, signature, program, kind, sampleLogs } = obj;
     const enriched = [];
-    for(const m of (mints||[])){
+  for(const m of (mints||[])){
       try{
         // fetch first signature for mint and include blockTime
         const sigs = await heliusRpc('getSignaturesForAddress', [m, { limit: 1 }]);
@@ -43,6 +43,22 @@ async function processOne(file){
         else enriched.push({ mint: m, firstSig: null, blockTime: null });
       }catch(e){ enriched.push({ mint: m, firstSig: null, blockTime: null }); }
     }
+    // Normalize blockTime values in the enriched output to milliseconds epoch when possible
+    try{
+      for(const ent of enriched){
+        try{
+          const bt = ent && (ent.blockTime || ent.block_time || ent.blocktime || null);
+          if(bt === null || bt === undefined) { ent.blockTime = null; continue; }
+          const n = Number(bt);
+          if(!n || Number.isNaN(n)) { ent.blockTime = null; continue; }
+          // if value looks like ms epoch (> 1e12) keep, if looks like seconds (>1e9) convert to ms
+          if(n > 1e12) ent.blockTime = Math.floor(n);
+          else if(n > 1e9) ent.blockTime = Math.floor(n * 1000);
+          else ent.blockTime = null;
+        }catch(e){}
+      }
+    }catch(e){}
+
     const notif = { time: new Date().toISOString(), program, signature, kind, enriched, sampleLogs };
     const outFile = path.join(NOTIF_DIR, Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.json');
     fs.writeFileSync(outFile, JSON.stringify(notif, null, 2), 'utf8');

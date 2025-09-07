@@ -6,6 +6,8 @@ export interface Strategy {
   minVolume?: number;
   minHolders?: number;
   minAge?: number;
+  // New unified max age in seconds; prefer this over minAge
+  maxAgeSec?: number;
   onlyVerified?: boolean;
   enabled?: boolean;
   buyAmount?: number;

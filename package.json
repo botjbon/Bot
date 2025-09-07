@@ -4,10 +4,11 @@
   "description": "growtrade bot on the top of growsol project",
   "main": "telegramBot.ts",
   "scripts": {
-    "serve": "nodemon ./telegramBot.ts",
-    "start": "npx ts-node telegramBot.ts",
-    "build": "npm run clean && tsc",
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "serve": "nodemon ./telegramBot.ts",
+  "start": "npx ts-node telegramBot.ts",
+  "clean": "rm -rf dist",
+  "build": "npm run clean && tsc",
+  "test": "jest test/freshness.test.ts --runInBand"
   },
   "keywords": [],
   "author": "",

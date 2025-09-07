@@ -28,13 +28,19 @@ export function normalizeStrategy(orig: any) {
   s.minLiquidity = s.minLiquidity !== undefined ? Number(s.minLiquidity) : undefined;
   s.minVolume = s.minVolume !== undefined ? Number(s.minVolume) : undefined;
   // Normalize minAge: accept numbers (seconds) or duration strings like '30s','2m'
+  // Normalize age field: interpret user's age setting as a maximum allowed age
+  // and expose it as `maxAgeSec` (seconds). Keep `minAge` undefined for
+  // backward compatibility but prefer `maxAgeSec` throughout the codebase.
   if (s.minAge !== undefined && s.minAge !== null) {
     try {
       const parsed = typeof s.minAge === 'string' ? parseDuration(s.minAge) : Number(s.minAge);
-      s.minAge = (parsed === undefined || isNaN(Number(parsed))) ? undefined : Number(parsed);
-    } catch (e) { s.minAge = undefined; }
+      const secs = (parsed === undefined || isNaN(Number(parsed))) ? undefined : Number(parsed);
+      s.maxAgeSec = secs; // unified max age in seconds
+    } catch (e) { s.maxAgeSec = undefined; }
   } else {
-    s.minAge = undefined;
+    s.maxAgeSec = undefined;
   }
+  // clear old field to avoid ambiguity
+  s.minAge = undefined;
   return s;
 }

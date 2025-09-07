@@ -13,8 +13,10 @@ export function validateStrategy(strategy: any): string[] {
   if (strategy.buyAmount !== undefined && (typeof strategy.buyAmount !== 'number' || isNaN(strategy.buyAmount) || strategy.buyAmount <= 0)) {
     issues.push('buyAmount should be a positive number.');
   }
-  if (strategy.minAge !== undefined) {
-    // allow numeric (seconds) or strings like '30s','2m'
+  // Accept either normalized maxAgeSec (seconds) or legacy minAge (seconds or duration string)
+  if (strategy.maxAgeSec !== undefined) {
+    if (isNaN(Number(strategy.maxAgeSec)) || Number(strategy.maxAgeSec) < 0) issues.push('maxAgeSec should be a non-negative number (seconds).');
+  } else if (strategy.minAge !== undefined) {
     const v = strategy.minAge;
     const parsed = (typeof v === 'number') ? v : (isNaN(Number(v)) ? null : Number(v));
     if (parsed === null && typeof v !== 'string') {

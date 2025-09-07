@@ -329,7 +329,7 @@ let __global_fetch_ts = 0;
 const __GLOBAL_FETCH_TTL = 1000 * 60 * 1; // 1 minute default
 
 // Helper: canonicalize and merge array of token-like objects into a deduped array keyed by normalized mint/address
-function mergeAndCanonicalizeCache(arr: any[]): any[] {
+export function mergeAndCanonicalizeCache(arr: any[]): any[] {
   try {
     const tu = require('./utils/tokenUtils');
     const map: Record<string, any> = {};
@@ -1198,20 +1198,55 @@ export async function mintPreviouslySeen(mint: string, txBlockTime: number | nul
     if (!res) return null;
     const arr = Array.isArray(res) ? res : (res?.result ?? res) || [];
     if (!Array.isArray(arr) || arr.length === 0) return false;
-    // If multiple signatures exist and the list contains signatures other than currentSig,
-    // consider the mint previously seen. Use lookback to bound our decision.
-    const sigs = arr.slice(0, lookback).map((x: any) => x?.signature || x?.txHash || x?.tx_hash).filter(Boolean);
-    if (!sigs.length) return null;
-    // If currentSig is provided and matches the newest signature, but there are older signatures => previously seen
-    if (currentSig) {
-      for (const s of sigs) {
-        if (s && s !== currentSig) return true;
+
+    // Build a small window of entries to inspect (objects with possible blockTime)
+    const window = arr.slice(0, lookback);
+    if (!window.length) return null;
+
+    // If no currentSig provided: more than one signature -> previously seen
+    if (!currentSig) return window.length > 1;
+
+    // Normalize txBlockTime to seconds for comparison
+    let txSec: number | null = null;
+    try {
+      const n = Number(txBlockTime as any);
+      if (!Number.isNaN(n)) {
+        txSec = n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
       }
-      // only signature encountered equals currentSig
-      return false;
+    } catch (e) { txSec = null; }
+
+    // Inspect entries for any signature other than currentSig and compare block times
+    for (const entry of window) {
+      try {
+        const sig = entry?.signature || entry?.txHash || entry?.tx_hash || null;
+        if (!sig) continue;
+        if (sig === currentSig) continue;
+        // candidate previous signature found
+        const btRaw = entry?.blockTime ?? entry?.block_time ?? entry?.blocktime ?? entry?.timestamp ?? null;
+        let btSec: number | null = null;
+        try {
+          const n = Number(btRaw as any);
+          if (!Number.isNaN(n)) btSec = n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+        } catch (e) { btSec = null; }
+
+        if (btSec && txSec) {
+          if (btSec < txSec) {
+            console.error(`DIAG_PREV_SEEN mint=${mint} sig=${sig} btSec=${btSec} txSec=${txSec} currentSig=${currentSig} -> PREVIOUS`);
+            return true;
+          } else {
+            console.error(`DIAG_PREV_NOT_PREVIOUS mint=${mint} sig=${sig} btSec=${btSec} txSec=${txSec} currentSig=${currentSig}`);
+            // continue searching other entries
+          }
+        } else {
+          // We found another signature but cannot compare times; treat as previously seen (conservative)
+          console.error(`DIAG_PREV_UNKNOWN mint=${mint} sig=${sig} btRaw=${String(btRaw)} txBlockTime=${String(txBlockTime)} currentSig=${currentSig} -> CONSERVATIVE_PREVIOUS`);
+          return true;
+        }
+      } catch (e) { continue; }
     }
-    // No currentSig provided: if more than 1 signature exists assume seen
-    return sigs.length > 1;
+
+    // No previous signature with earlier blockTime found
+    return false;
   } catch (e) {
     return null;
   }
@@ -1638,9 +1673,10 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
 
   // slot fallback already attempted via getBlockTimeForSlotCached earlier; no-op here
 
-    if (!earliestBlockTime) return null;
-    const nowSec = Math.floor(Date.now() / 1000);
-    const ageSeconds = nowSec - Number(earliestBlockTime);
+  if (!earliestBlockTime) return null;
+  // normalize earliestBlockTime (which may be seconds or ms) to ms
+  const earliestBlockTimeMs = Number(earliestBlockTime) > 1e12 ? Number(earliestBlockTime) : Math.floor(Number(earliestBlockTime) * 1000);
+  const ageSeconds = Math.floor((Date.now() - earliestBlockTimeMs) / 1000);
 
     // If token looks very young, do a deeper signature parse scan to avoid picking a later swap as the 'first'
     try {
@@ -1758,7 +1794,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
 
     const validated = metadataExists || (supply !== null && supply > 0);
     const detectedAtSec = (mintOrObj as any)?.detectedAtSec ?? Math.floor(Date.now() / 1000);
-    const detection = { mint, firstBlockTime: earliestBlockTime, ageSeconds, metadataExists, supply, firstSignature, detectedAtSec };
+  const detection = { mint, firstBlockTime: earliestBlockTimeMs, ageSeconds, metadataExists, supply, firstSignature, detectedAtSec };
 
     // If this mint appears previously in history, skip notifying users to avoid duplicates
     try {
@@ -1777,7 +1813,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
           const u = users[uid];
           if (!u || !u.strategy || u.strategy.enabled === false) continue;
           const strat = normalizeStrategy(u.strategy);
-          const tokenObj = { mint, address: mint, metadataExists, supply, firstBlockTime: detection.firstBlockTime, ageSeconds: detection.ageSeconds };
+          const tokenObj = { mint, address: mint, metadataExists, supply, firstBlockTime: detection.firstBlockTime, ageSeconds: detection.ageSeconds, _canonicalAgeSeconds: detection.ageSeconds };
           const matches = await filterTokensByStrategy([tokenObj], strat, { preserveSources: true });
           if (Array.isArray(matches) && matches.length) {
             try {
@@ -2025,7 +2061,11 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
                 const f3 = Array.isArray(arr3) && arr3[0] ? arr3[0] : null;
                 const bt3 = f3?.blockTime ?? f3?.block_time ?? f3?.blocktime ?? null;
                 if (bt3) {
-                    results.push({ mint: t.mint, firstBlockTime: Number(bt3), ageSeconds: nowSec - Number(bt3), source: 'helius-rpc', earliestSignature: (f3 && (f3.signature || (f3 as any).txHash || (f3 as any).tx_hash)) || null });
+                    {
+                      const btNum = Number(bt3);
+                      const btMs = btNum > 1e12 ? btNum : Math.floor(btNum * 1000);
+                      results.push({ mint: t.mint, firstBlockTime: btMs, ageSeconds: Math.max(0, Math.floor((Date.now() - btMs) / 1000)), source: 'helius-rpc', earliestSignature: (f3 && (f3.signature || (f3 as any).txHash || (f3 as any).tx_hash)) || null });
+                    }
                   hostState[hk] = state;
                   return;
                 }
@@ -2053,7 +2093,11 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
                     const bt = first?.blockTime || first?.time || first?.timestamp || null;
                     if (bt) {
                       const meta = makeSourceMeta('solscan', true, { latencyMs: Date.now() - nowSec * 1000, raw: first });
-                      results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'solscan', earliestSignature: (first && (first.signature || (first as any).txHash || (first as any).tx_hash)) || null, __meta: meta });
+                      {
+                        const btNum = Number(bt);
+                        const btMs = btNum > 1e12 ? btNum : Math.floor(btNum * 1000);
+                        results.push({ mint: t.mint, firstBlockTime: btMs, ageSeconds: Math.max(0, Math.floor((Date.now() - btMs) / 1000)), source: 'solscan', earliestSignature: (first && (first.signature || (first as any).txHash || (first as any).tx_hash)) || null, __meta: meta });
+                      }
                       hostState[hk] = state;
                       return;
                     }
@@ -2115,7 +2159,11 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
               return;
             }
 
-                  results.push({ mint: t.mint, firstBlockTime: Number(bt2), ageSeconds: nowSec - Number(bt2), source: 'helius-rpc', earliestSignature: sig2 || null });
+                  {
+                    const btNum = Number(bt2);
+                    const btMs = btNum > 1e12 ? btNum : Math.floor(btNum * 1000);
+                    results.push({ mint: t.mint, firstBlockTime: btMs, ageSeconds: Math.max(0, Math.floor((Date.now() - btMs) / 1000)), source: 'helius-rpc', earliestSignature: sig2 || null });
+                  }
             hostState[hk] = state;
             return;
           }
@@ -2201,7 +2249,11 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
           }
         } catch (e) {}
 
-  results.push({ mint: t.mint, firstBlockTime: Number(minBt), ageSeconds: nowSec - Number(minBt), source: 'helius-fast', earliestSignature: earliestSig || null });
+  {
+    const btNum = Number(minBt);
+    const btMs = btNum > 1e12 ? btNum : Math.floor(btNum * 1000);
+    results.push({ mint: t.mint, firstBlockTime: btMs, ageSeconds: Math.max(0, Math.floor((Date.now() - btMs) / 1000)), source: 'helius-fast', earliestSignature: earliestSig || null });
+  }
         hostState[hk] = state;
         return;
       } catch (e) {

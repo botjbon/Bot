@@ -175,10 +175,17 @@ export async function executeHoneyStrategy(
   const filteredTokens = settings.tokens.filter(token => {
   // Example: Filter by volume and age (can be expanded for other fields)
     if (typeof token.volume !== 'undefined' && user.strategy?.minVolume && token.volume < user.strategy.minVolume) return false;
-    if (typeof token.ageMinutes !== 'undefined' && user.strategy?.minAge) {
-      // token.ageMinutes is in minutes; user.strategy.minAge is normalized to seconds -> convert token to seconds
-      const tokenAgeSeconds = Number(token.ageMinutes) * 60;
-      if (tokenAgeSeconds < Number(user.strategy.minAge)) return false;
+    // Interpret user strategy age as max allowed age in seconds (use normalized field when available)
+    if (typeof token.ageMinutes !== 'undefined') {
+      const rawMax = user.strategy?.maxAgeSec !== undefined ? user.strategy.maxAgeSec : user.strategy?.minAge;
+      if (rawMax !== undefined && rawMax !== null) {
+        const tokenAgeSeconds = Number(token.ageMinutes) * 60;
+        if (isNaN(Number(rawMax))) {
+          // If the strategy value is non-numeric, be conservative and reject the token
+          return false;
+        }
+        if (tokenAgeSeconds > Number(rawMax)) return false; // reject tokens older than the max allowed age
+      }
     }
     return true;
   });

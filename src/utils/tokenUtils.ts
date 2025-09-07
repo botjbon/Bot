@@ -898,8 +898,12 @@ export async function computeFreshnessScore(token: any): Promise<{ score: number
   if (enableOnchain && addr) {
     try {
       // Keep on-chain check short to avoid long blocking; use withTimeout utility
+  if (LISTENER_ONLY_MODE) {
+    console.error(`DIAG_ONCHAIN_SKIPPED LISTENER_ONLY_MODE addr=${addr}`);
+  } else {
   const res = await withTimeout(checkOnChainActivity(addr), Number(ONCHAIN_FRESHNESS_TIMEOUT_MS || 3000), 'onchain-freshness');
-      onChainTs = res.firstTxMs || null;
+    onChainTs = res.firstTxMs || null;
+  }
     } catch (e) {
       onChainTs = null;
     }
@@ -1110,15 +1114,23 @@ function getTokenStats(token: any) {
   const liquidity = extractNumeric(getField(token, 'liquidity'));
   const volume = extractNumeric(getField(token, 'volume'));
   const holders = extractNumeric(getField(token, 'holders'));
-  let age = getField(token, 'age', 'createdAt');
-  // حذف سطر الهولدرز نهائياً
+  // Prefer canonical on-chain age fields (seconds) when available to avoid unit confusion.
   let ageDisplay: string = 'Not available';
   let ageMs: number | undefined = undefined;
-  if (typeof age === 'string') age = Number(age);
-  if (typeof age === 'number' && !isNaN(age)) {
-    if (age > 1e12) ageMs = Date.now() - age; // ms timestamp
-    else if (age > 1e9) ageMs = Date.now() - age * 1000; // s timestamp
-    else if (age < 1e7 && age > 0) ageMs = age * 60 * 1000; // minutes
+  // canonical seconds sources
+  const canonSec = (token && token._canonicalAgeSeconds !== undefined && token._canonicalAgeSeconds !== null) ? Number(token._canonicalAgeSeconds) :
+                    (typeof token.ageSeconds === 'number' && !isNaN(token.ageSeconds) ? Number(token.ageSeconds) : undefined);
+  if (canonSec !== undefined && !isNaN(canonSec)) {
+    if (canonSec >= 0) ageMs = Math.floor(canonSec * 1000);
+  } else {
+    // fallback: legacy 'age' or 'createdAt' fields
+    let age = getField(token, 'age', 'createdAt');
+    if (typeof age === 'string') age = Number(age);
+    if (typeof age === 'number' && !isNaN(age)) {
+      if (age > 1e12) ageMs = Date.now() - age; // ms timestamp
+      else if (age > 1e9) ageMs = Date.now() - age * 1000; // s timestamp
+      else if (age < 1e7 && age > 0) ageMs = age * 60 * 1000; // minutes
+    }
   }
   if (typeof ageMs === 'number' && !isNaN(ageMs) && ageMs > 0) {
     const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));

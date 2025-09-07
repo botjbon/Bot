@@ -51,6 +51,17 @@ function startSlotBlocktimeWarmer(opts?: { intervalMs?: number, lookbackSlots?: 
   } catch (e) {}
 }
 function stopSlotBlocktimeWarmer() { try { if (_slotBlocktimeWarmerHandle) { clearInterval(_slotBlocktimeWarmerHandle); _slotBlocktimeWarmerHandle = null; } } catch (e) {} }
+// Normalize a timestamp value (seconds or ms) into ms epoch, or return null
+function tsToMs(v: any): number | null {
+  try {
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    if (!n || Number.isNaN(n)) return null;
+    if (n > 1e12) return Math.floor(n);
+    if (n > 1e9) return Math.floor(n * 1000);
+    return null;
+  } catch (e) { return null; }
+}
 const HELIUS_WS_URL = getHeliusWebsocketUrl();
 const USE_WS = HELIUS_USE_WEBSOCKET;
 const SUBSCRIBE_METADATA = HELIUS_SUBSCRIBE_METADATA;
@@ -667,16 +678,16 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
                     const elapsed2 = Date.now() - start2;
                     if (bt || bt === 0) {
                       _heliusListenerStats.bgResolved = (_heliusListenerStats.bgResolved || 0) + 1;
-                      const follow = {
-                        mint: evt.mint || null,
-                        eventType: evt.eventType || null,
-                        detectedAt: evt.detectedAt || null,
-                        slot: slotNum,
-                        signature: sig,
-                        blockTime: bt,
-                        score: (typeof score === 'number' && !Number.isNaN(score)) ? Number(score.toFixed ? score.toFixed(3) : score) : null,
-                        _diag: { blockTimeDiag: { reason: 'background-resolved', elapsedMs: elapsed2 } }
-                      };
+                                  const follow = {
+                                    mint: evt.mint || null,
+                                    eventType: evt.eventType || null,
+                                    detectedAt: evt.detectedAt || null,
+                                    slot: slotNum,
+                                    signature: sig,
+                                    blockTime: tsToMs(bt) || null,
+                                    score: (typeof score === 'number' && !Number.isNaN(score)) ? Number(score.toFixed ? score.toFixed(3) : score) : null,
+                                    _diag: { blockTimeDiag: { reason: 'background-resolved', elapsedMs: elapsed2 } }
+                                  };
                       try { if (VERBOSE) console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime=', bt, 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
                       if (VERBOSE) console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
                     } else {
@@ -724,7 +735,7 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
             detectedAt: evt.detectedAt || null,
             slot: slot,
             signature: sig,
-            blockTime: blockTime,
+            blockTime: tsToMs(blockTime) || null,
             score: (typeof score === 'number' && !Number.isNaN(score)) ? Number(score.toFixed ? score.toFixed(3) : score) : null,
           };
           // attach mintSnapshot if available

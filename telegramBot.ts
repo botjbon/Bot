@@ -53,6 +53,9 @@ const HELIUS_BATCH_DELAY_MS = Number(process.env.HELIUS_BATCH_DELAY_MS ?? 250);
 const HELIUS_ENRICH_LIMIT = Number(process.env.HELIUS_ENRICH_LIMIT ?? 25);
 const ONCHAIN_FRESHNESS_TIMEOUT_MS = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS ?? 5000);
 console.log('--- dotenv loaded ---');
+// Global default: show-token and notify should apply age-only filtering by default.
+// Can be overridden per-user by setting user.strategy.ageOnly = false
+const GLOBAL_AGE_ONLY_DEFAULT = (process.env.GLOBAL_AGE_ONLY_DEFAULT === undefined) ? true : (String(process.env.GLOBAL_AGE_ONLY_DEFAULT).toLowerCase() === 'true');
 // Enforce listener-only safe mode: when true, avoid making disk-based reads/writes in active user paths.
 // Controlled via env LISTENER_ONLY_MODE or LISTENER_ONLY. Default to true.
 const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
@@ -85,19 +88,18 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
   try {
     // Convert strategy.maxTrades -> maxCollect
     const maxCollect = Math.max(1, Number(strategy?.maxTrades || 3));
-    // Convert minAge field to seconds if present
+    // Convert strategy age to maxAgeSec (seconds). Prefer normalized field when available.
     let maxAgeSec: number | undefined = undefined;
     try {
-      const ma = strategy && (strategy as any).minAge;
-      if (ma !== undefined && ma !== null) {
-        const s = String(ma).trim().toLowerCase();
-        const secMatch = s.match(/^([0-9]+)s$/);
-        const minMatch = s.match(/^([0-9]+)m$/);
-        if (secMatch) maxAgeSec = Number(secMatch[1]);
-        else if (minMatch) maxAgeSec = Number(minMatch[1]) * 60;
-        else if (!isNaN(Number(s))) {
-          // Plain numeric values are seconds
-          maxAgeSec = Number(s);
+      if (strategy && (strategy as any).maxAgeSec !== undefined) {
+        const n = Number((strategy as any).maxAgeSec);
+        if (!isNaN(n)) maxAgeSec = n;
+      } else {
+        const ma = strategy && (strategy as any).minAge;
+        if (ma !== undefined && ma !== null) {
+          const parseDuration = require('./src/utils/tokenUtils').parseDuration;
+          const parsed = parseDuration(ma);
+          if (!isNaN(Number(parsed)) && parsed !== undefined && parsed !== null) maxAgeSec = Number(parsed);
         }
       }
     } catch (e) {}
@@ -118,9 +120,17 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
     // If user specified a minAge, enforce it strictly here (same semantics as listener)
     try{
       const parseDuration = require('./src/utils/tokenUtils').parseDuration;
-      const ma = strategy && (strategy as any).minAge;
-      const minAgeSeconds = ma !== undefined && ma !== null ? parseDuration(ma) : undefined;
-      if (!isNaN(Number(minAgeSeconds)) && minAgeSeconds !== undefined && minAgeSeconds !== null && Number(minAgeSeconds) > 0) {
+      // prefer normalized maxAgeSec when available, otherwise parse legacy minAge
+      let maxAgeSeconds: number | undefined = undefined;
+      if (strategy && (strategy as any).maxAgeSec !== undefined) {
+        const n = Number((strategy as any).maxAgeSec);
+        if (!isNaN(n)) maxAgeSeconds = n;
+      } else {
+        const ma = strategy && (strategy as any).minAge;
+        const parsed = ma !== undefined && ma !== null ? parseDuration(ma) : undefined;
+        if (!isNaN(Number(parsed)) && parsed !== undefined && parsed !== null) maxAgeSeconds = Number(parsed);
+      }
+      if (!isNaN(Number(maxAgeSeconds)) && maxAgeSeconds !== undefined && maxAgeSeconds !== null && Number(maxAgeSeconds) > 0) {
         const accepted = tokens.filter((t: any) => {
           try{
             // prefer _canonicalAgeSeconds (seconds)
@@ -132,7 +142,8 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
               if (!isNaN(ftMs) && ftMs > 0) ageSec = (Date.now() - ftMs) / 1000;
             }
             if (ageSec === undefined || isNaN(ageSec)) return false; // strict: require known on-chain age
-            return ageSec >= Number(minAgeSeconds);
+            // Accept tokens younger or equal to the max allowed age
+            return ageSec <= Number(maxAgeSeconds);
           }catch(e){ return false; }
         });
         return accepted;
@@ -247,6 +258,8 @@ bot.hears('📊 Show Tokens', async (ctx) => {
   try {
     const userId = String(ctx.from?.id);
     const user = users[userId] || {};
+  // Determine effective age-only mode: per-user override or global default
+  const ageOnlyMode = (user && user.strategy && (user.strategy as any).ageOnly !== undefined) ? Boolean((user.strategy as any).ageOnly) : GLOBAL_AGE_ONLY_DEFAULT;
     // Build options for collector from user's strategy
     const maxCollect = Math.max(1, Number(user.strategy?.maxTrades || 3));
     const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
@@ -332,19 +345,29 @@ bot.command('notify_tokens', async (ctx) => {
   console.log(`[notify_tokens] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   const user = users[userId];
+  // effective age-only mode (per-user override or global default)
+  const ageOnlyMode = (user && user.strategy && (user.strategy as any).ageOnly !== undefined) ? Boolean((user.strategy as any).ageOnly) : GLOBAL_AGE_ONLY_DEFAULT;
   if (!user || !user.strategy || !user.strategy.enabled) {
     await ctx.reply('❌ You must set a strategy first using /strategy');
     return;
   }
   const now = Date.now();
   const tokens = await getTokensForUser(userId, user.strategy);
-  let filteredTokens = [] as any[];
-  if (userIsListenerOnly(user)) {
-    // Preserve the listener-provided candidates without background enrichment
-    filteredTokens = tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
-  } else {
-    filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy, { preserveSources: true }));
-  }
+    let filteredTokens: any[] = [];
+    try {
+      if (ageOnlyMode) {
+        // Age-only mode: accept listener candidates and skip heavy filtering
+        filteredTokens = tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
+      } else if (userIsListenerOnly(user)) {
+        // Preserve the listener-provided candidates without background enrichment
+        filteredTokens = tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
+      } else {
+        filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy, { preserveSources: true }));
+      }
+    } catch (e) {
+      console.error('[notify_tokens] filtering failed:', e);
+      filteredTokens = [];
+    }
   if (!filteredTokens.length) {
     await ctx.reply('No tokens currently match your strategy.');
     return;
@@ -752,13 +775,14 @@ bot.command('show_token', async (ctx) => {
   }
   try {
     // If user's numeric strategy fields are all zero/undefined, present listener/live candidates immediately
-    const strategyRef = (user && user.strategy) ? user.strategy : {};
+  const strategyRef = (user && user.strategy) ? user.strategy : {};
     const numericKeys = ['minMarketCap','minLiquidity','minVolume','minAge'];
     const hasNumericConstraint = numericKeys.some(k => {
       const v = strategyRef && (strategyRef as any)[k];
       return v !== undefined && v !== null && Number(v) > 0;
     });
-    if (!hasNumericConstraint) {
+  // If user requests age-only behavior, prefer the fast listener-produced candidates
+  if (((user && user.strategy && (user.strategy as any).ageOnly !== undefined) ? Boolean((user.strategy as any).ageOnly) : GLOBAL_AGE_ONLY_DEFAULT) || !hasNumericConstraint) {
       // Fast path: return listener-produced candidates (or fastFetcher) without heavy enrichment
       try { await ctx.reply('🔎 Fetching latest live mints from listener — fast preview...'); } catch(e){}
       // Try to use the sequential listener's one-shot collector when available.
@@ -769,30 +793,15 @@ bot.command('show_token', async (ctx) => {
       try{
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const seq = require('./scripts/sequential_10s_per_program.js');
-        if(seq && typeof seq.collectFreshMints === 'function'){
+          if(seq && typeof seq.collectFreshMintsPerUser === 'function'){
           listenerAvailable = true;
-          // convert user's strategy.minAge to seconds when present
-          let maxAgeSec: number | undefined = undefined;
-          try{
-            const ma = strategyRef && (strategyRef as any).minAge;
-            if(ma !== undefined && ma !== null){
-              // allow strings like '10s', '5m', or plain numbers
-              const s = String(ma).trim().toLowerCase();
-              const secMatch = s.match(/^([0-9]+)s$/);
-              const minMatch = s.match(/^([0-9]+)m$/);
-              if(secMatch) maxAgeSec = Number(secMatch[1]);
-              else if(minMatch) maxAgeSec = Number(minMatch[1]) * 60;
-              else if(!isNaN(Number(s))){
-                const n = Number(s);
-                // treat small values (0,1,2) as seconds per prior convention
-                if(n <= 2) maxAgeSec = n;
-                else maxAgeSec = n * 60;
-              }
-            }
-          }catch(e){}
           const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-          const addrs = await seq.collectFreshMints({ maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), maxAgeSec, strictOverride }).catch(()=>[]);
-          tokens = (addrs || []).map((a:any)=>({ tokenAddress: a, address: a, mint: a, sourceCandidates: true, __listenerCollected: true }));
+          const usersObj: Record<string, any> = {};
+          usersObj[userId] = user;
+          // Use per-user collector so user's strategy fields (minAge/maxAge) are applied at collection time
+          const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride }).catch(()=>({}));
+          const entry = collected && collected[userId] ? collected[userId] : null;
+          tokens = (entry && Array.isArray(entry.tokens)) ? entry.tokens.map((it:any)=> Object.assign({ tokenAddress: it.mint || it.tokenAddress || it.address, address: it.mint || it.tokenAddress || it.address, mint: it.mint || it.tokenAddress || it.address, sourceCandidates: true, __listenerCollected: true }, it)) : [];
         }
       }catch(e){ listenerAvailable = false; }
       if(listenerAvailable){
@@ -866,11 +875,16 @@ bot.command('show_token', async (ctx) => {
           const maxCollect = Math.max(1, Number(user.strategy?.maxTrades || 3));
           let maxAgeSec: number | undefined = undefined;
           try{
-            const parseDuration = require('./src/utils/tokenUtils').parseDuration;
-            const ma = user.strategy && (user.strategy as any).minAge;
-            if(ma !== undefined && ma !== null){
-              const parsed = parseDuration(ma);
-              if(!isNaN(Number(parsed)) && parsed !== undefined && parsed !== null) maxAgeSec = Number(parsed);
+            if (user.strategy && (user.strategy as any).maxAgeSec !== undefined) {
+              const n = Number((user.strategy as any).maxAgeSec);
+              if (!isNaN(n)) maxAgeSec = n;
+            } else {
+              const parseDuration = require('./src/utils/tokenUtils').parseDuration;
+              const ma = user.strategy && (user.strategy as any).minAge;
+              if(ma !== undefined && ma !== null){
+                const parsed = parseDuration(ma);
+                if(!isNaN(Number(parsed)) && parsed !== undefined && parsed !== null) maxAgeSec = Number(parsed);
+              }
             }
           }catch(e){}
           const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;

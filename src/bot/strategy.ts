@@ -307,21 +307,15 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
       const v = (strategy as any)?.[k];
       return v !== undefined && v !== null && Number(v) > 0;
     });
-    let minAgeIsConstraint = false;
+    let maxAgeIsConstraint = false;
     try {
-      const ma = (strategy as any)?.minAge;
+      const ma = (strategy as any)?.maxAgeSec ?? (strategy as any)?.minAge;
       if (ma !== undefined && ma !== null) {
-        if (typeof ma === 'number' || !isNaN(Number(ma))) {
-          const num = Number(ma);
-          // Any numeric minAge > 0 counts as a constraint (interpreted as seconds).
-          if (num > 0) minAgeIsConstraint = true;
-        } else {
-          // string value (eg. '30s', '2m') - treat as constraint conservatively
-          minAgeIsConstraint = true;
-        }
+        const num = Number(ma);
+        if (!isNaN(num) && num > 0) maxAgeIsConstraint = true;
       }
     } catch (e) {}
-    const hasNumericConstraint = hasOtherNumericConstraint || minAgeIsConstraint;
+    const hasNumericConstraint = hasOtherNumericConstraint || maxAgeIsConstraint;
     if ((opts && opts.preserveSources) && !hasNumericConstraint) {
       const looksLikeListener = tokens.length > 0 && tokens.every(t => t && (t.sourceProgram || t.sourceSignature || t.sourceCandidates || (t.sourceTags && Array.isArray(t.sourceTags) && t.sourceTags.some((s: string) => /helius|listener|ws|dexscreener/i.test(s) ))));
       if (looksLikeListener) {
@@ -335,11 +329,24 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
     // If caller requested to preserve sources but the only numeric constraint is minAge,
     // we can do a fast per-mint age check to avoid a full enrichment pass. This keeps
     // listener speed while honoring per-user second-level minAge requirements.
-    try {
+      try {
       if ((opts && opts.preserveSources) && !hasOtherNumericConstraint) {
-        const maRaw = (strategy as any)?.minAge;
-        const minAgeSeconds = maRaw !== undefined && maRaw !== null ? Number(maRaw) : undefined;
-        if (!isNaN(minAgeSeconds) && minAgeSeconds > 0) {
+  const maRaw = (strategy as any)?.maxAgeSec ?? (strategy as any)?.minAge;
+  const maxAgeSeconds = maRaw !== undefined && maRaw !== null ? Number(maRaw) : undefined;
+  // interpret provided age as seconds (maximum allowed age)
+  if (!isNaN(maxAgeSeconds) && maxAgeSeconds > 0) {
+            // helper: normalize various timestamp representations to ms epoch
+            const tsToMs = (v: any) => {
+              try{
+                const n = Number(v);
+                if (!n || isNaN(n)) return null;
+                // values > 1e12 are likely already ms epoch
+                if (n > 1e12) return n;
+                // values > 1e9 are likely epoch seconds -> convert to ms
+                if (n > 1e9) return n * 1000;
+                return null;
+              }catch(e){return null;}
+            };
           // Attempt to accept tokens quickly if they already have on-chain age fields
           const fastAccepted: any[] = [];
           const fastRejected: any[] = [];
@@ -352,9 +359,12 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
               const ageKnown = (tkn && (tkn._canonicalAgeSeconds || tkn.ageSeconds || tkn.firstBlockTime || tkn.poolOpenTimeMs));
               if (ageKnown) {
                 let ageSec = Number(tkn._canonicalAgeSeconds || tkn.ageSeconds || 0);
-                if (!ageSec && tkn.firstBlockTime) ageSec = (Date.now() - (Number(tkn.firstBlockTime) * 1000)) / 1000;
-                if (!ageSec && tkn.poolOpenTimeMs) ageSec = (Date.now() - Number(tkn.poolOpenTimeMs)) / 1000;
-                if (!isNaN(ageSec) && ageSec >= minAgeSeconds) {
+                if ((!ageSec || ageSec === 0) && tkn.firstBlockTime) {
+                  const fbMs = tsToMs(tkn.firstBlockTime);
+                  if (fbMs) ageSec = (Date.now() - fbMs) / 1000;
+                }
+                if ((!ageSec || ageSec === 0) && tkn.poolOpenTimeMs) ageSec = (Date.now() - Number(tkn.poolOpenTimeMs)) / 1000;
+                if (!isNaN(ageSec) && ageSec <= maxAgeSeconds) {
                   fastAccepted.push(tkn);
                   continue;
                 }
@@ -363,8 +373,10 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
               if (ff && typeof ff.fetchFirstSignatureForMint === 'function') {
                 const probe = await ff.fetchFirstSignatureForMint(tkn.tokenAddress || tkn.mint || tkn.address).catch(() => null);
                 if (probe && probe.firstBlockTime) {
-                  const ageSec = (Date.now() - (Number(probe.firstBlockTime) * 1000)) / 1000;
-                  if (ageSec >= minAgeSeconds) { fastAccepted.push({...tkn, firstBlockTime: probe.firstBlockTime, _canonicalAgeSeconds: ageSec}); continue; }
+                  const fbMs = tsToMs(probe.firstBlockTime);
+                  const ageSec = fbMs ? (Date.now() - fbMs) / 1000 : null;
+                  // Accept tokens younger or equal than the maxAgeSeconds
+                  if (ageSec !== null && ageSec <= maxAgeSeconds) { fastAccepted.push({...tkn, firstBlockTime: fbMs || probe.firstBlockTime, _canonicalAgeSeconds: ageSec}); continue; }
                   else { fastRejected.push(tkn); continue; }
                 }
               }
@@ -445,7 +457,7 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
   // Selective enrichment: when the strategy requires strict numeric/on-chain checks,
   // enrich a small set of top candidates (bounded concurrency) to obtain liquidity/volume/age fields
   try {
-  const needStrictNumeric = (strategy.minLiquidity !== undefined || strategy.minVolume !== undefined || strategy.minAge !== undefined || (strategy as any).requireOnchain === true);
+  const needStrictNumeric = (strategy.minLiquidity !== undefined || strategy.minVolume !== undefined || (strategy as any).maxAgeSec !== undefined || strategy.minAge !== undefined || (strategy as any).requireOnchain === true);
   // If caller requested a fast-only pass, skip selective on-chain enrichment to remain responsive.
   if (!(opts && opts.fastOnly) && needStrictNumeric && Array.isArray(prelim) && prelim.length > 0) {
       const tu = require('../utils/tokenUtils');
@@ -554,19 +566,15 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
       ageSeconds = token.ageMinutes * 60;
     }
 
-    // If age is unknown and the strategy requires a minimum age, reject tokens
-    // that don't have a known on-chain age when the required min age is >= 60s
-    // Normalize strategy.minAge: numbers are seconds, strings parsed by parseDuration (returns seconds)
-    const minAgeSeconds = strategy.minAge !== undefined
-      ? parseDuration(strategy.minAge as any)
-      : undefined;
-    if (minAgeSeconds !== undefined) {
+    // If strategy specifies a maximum allowed age (maxAgeSec), enforce it.
+    // `maxAgeSec` is expected to be seconds. Reject tokens older than maxAgeSec.
+    const maxAgeSec = (strategy as any)?.maxAgeSec !== undefined ? Number((strategy as any).maxAgeSec) : undefined;
+    if (maxAgeSec !== undefined && !isNaN(maxAgeSec)) {
       if (ageSeconds === undefined || isNaN(ageSeconds)) {
-        // Require a known on-chain age for any minAge > 0 seconds.
-        // (minAge === 0 remains permissive when age is unknown)
-        if (minAgeSeconds > 0) return false;
+        // Require known on-chain age when a maxAgeSec > 0 is requested
+        if (maxAgeSec > 0) return false;
       } else {
-        if (ageSeconds < minAgeSeconds) return false;
+        if (ageSeconds > maxAgeSec) return false;
       }
     }
 

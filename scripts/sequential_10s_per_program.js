@@ -82,14 +82,16 @@ const ALWAYS_PROCESS_KINDS = new Set(['initialize']);
 const DENY = new Set(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v','Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB','So11111111111111111111111111111111111111112','TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA']);
 
 // Configurable timings (ms) via environment variables
-const PER_PROGRAM_DURATION_MS = Number(process.env.PER_PROGRAM_DURATION_MS) || 20000;
-const INNER_SLEEP_MS = Number(process.env.INNER_SLEEP_MS) || 180;
-const POLL_SLEEP_MS = Number(process.env.POLL_SLEEP_MS) || 800;
-const CYCLE_SLEEP_MS = Number(process.env.CYCLE_SLEEP_MS) || 2500;
-// Increase defaults during testing to avoid overly-strict rejection of valid mints
-const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 32;
-// raise default to allow checking a few historical signatures for accuracy
-const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 24;
+// Reduce per-program window to cycle faster and improve chance of catching very-new mints
+const PER_PROGRAM_DURATION_MS = Number(process.env.PER_PROGRAM_DURATION_MS) || 8000;
+const INNER_SLEEP_MS = Number(process.env.INNER_SLEEP_MS) || 120;
+// poll sleep controls delay between quick retries; lower value = more responsiveness (more RPCs)
+const POLL_SLEEP_MS = Number(process.env.POLL_SLEEP_MS) || 250;
+const CYCLE_SLEEP_MS = Number(process.env.CYCLE_SLEEP_MS) || 1500;
+// Increase batch scanning to examine more recent signatures in a single RPC
+const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 48;
+// reduce historical signature window to reduce probe cost and favor very recent first-sig checks
+const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 12;
 // Freshness and first-signature matching configuration
 // Proposal 1: widen default window slightly to capture marginally delayed mints
 // default max mint age (seconds) when not provided via env
@@ -104,7 +106,8 @@ const LATEST_COLLECTED = [];
 const CAPTURE_ONLY = (process.env.CAPTURE_ONLY === 'true');
 // TTL for caching first-signature probes (ms). Configurable via env, with a dynamic
 // adjustment when upstream rate-limits increase to reduce probe pressure.
-const FIRST_SIG_TTL_MS = Number(process.env.FIRST_SIG_TTL_MS) || 15000;
+// Lower default so we re-probe more frequently for fresh mints during fast testing
+const FIRST_SIG_TTL_MS = Number(process.env.FIRST_SIG_TTL_MS) || 8000;
 let _lastFirstSigCleanup = 0;
 function computeFirstSigTTL(){
   try{
@@ -117,6 +120,11 @@ function computeFirstSigTTL(){
 }
 const FIRST_SIG_MATCH_WINDOW_SECS = Number(process.env.FIRST_SIG_MATCH_WINDOW_SECS) || 6; // allowed delta between firstSig.blockTime and tx.blockTime
 const FIRST_SIG_CACHE = new Map(); // mint -> { sig, blockTime, ts }
+
+// Global listener strict acceptance threshold (seconds). When set, only accept
+// a candidate mint when its first-signature equals the current tx sig AND
+// the canonical age is <= this threshold. Default 16 seconds (tweakable via env).
+const GLOBAL_MAX_ACCEPT_AGE_SEC = Number(process.env.GLOBAL_MAX_ACCEPT_AGE_SEC || 16);
 
 async function getFirstSignatureCached(mint){
   if(!mint) return null;
@@ -201,7 +209,8 @@ async function heliusRpc(method, params){
 const HELIUS_TX_OPTS = { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 };
 
 // Concurrency and retry tuning for getTransaction calls
-const TX_CONCURRENCY = Number(process.env.TX_CONCURRENCY) || 5;
+// Increase default concurrency to speed fetching many txs in parallel (tune to your key limits)
+const TX_CONCURRENCY = Number(process.env.TX_CONCURRENCY) || 8;
 const MAX_TX_RETRIES = Number(process.env.MAX_TX_RETRIES) || 3;
 const TX_RETRY_BASE_MS = Number(process.env.TX_RETRY_BASE_MS) || 150;
 
@@ -341,11 +350,62 @@ async function mintPreviouslySeen(mint, txBlockTime, currentSig){
     // reduced limit to lower RPC cost; configurable via MINT_SIG_LIMIT
     const sigs = await heliusRpc('getSignaturesForAddress', [mint, { limit: MINT_SIG_LIMIT }]);
     if(!Array.isArray(sigs) || sigs.length===0) return false;
+    // Normalize block times to milliseconds for safe comparison
+    const txBlockMs = (txBlockTime && Number(txBlockTime) > 1e12) ? Number(txBlockTime) : ((txBlockTime && Number(txBlockTime) > 1e9) ? Number(txBlockTime) * 1000 : (txBlockTime ? Number(txBlockTime) : null));
     for(const s of sigs){
-      try{ const sig = getSig(s); const bt = s.blockTime||s.block_time||s.blocktime||null; if(sig && sig!==currentSig && bt && txBlockTime && bt < txBlockTime) return true; }catch(e){}
+      try{
+        const sig = getSig(s);
+        const rawBt = s.blockTime||s.block_time||s.blocktime||null;
+        const btMs = (rawBt && Number(rawBt) > 1e12) ? Number(rawBt) : ((rawBt && Number(rawBt) > 1e9) ? Number(rawBt) * 1000 : (rawBt ? Number(rawBt) : null));
+        if(sig && sig!==currentSig && btMs && txBlockMs && btMs < txBlockMs) return true;
+      }catch(e){}
     }
     return false;
   }catch(e){ return true; }
+}
+
+// Centralized freshness check used by listener and collector.
+// Ensures: (1) canonical age is available and <= GLOBAL_MAX_ACCEPT_AGE_SEC,
+// (2) first-signature semantics for swaps/initializes and not previously seen,
+// (3) when necessary, verifies creation-in-this-tx.
+async function isMintFresh(mint, tx, txBlockTime, currentSig, kind, maxAcceptAgeSec){
+  try{
+    if(!mint) return false;
+    // compute canonical age using cached firstSig when possible
+  const getter = (module.exports && module.exports.getFirstSignatureCached) ? module.exports.getFirstSignatureCached : getFirstSignatureCached;
+  const prevChecker = (module.exports && module.exports.mintPreviouslySeen) ? module.exports.mintPreviouslySeen : mintPreviouslySeen;
+  const first = await getter(mint).catch(()=>null);
+    const ft = first && first.blockTime ? first.blockTime : null;
+    const ageSec = getCanonicalAgeSeconds(ft, txBlockTime);
+    if(ageSec === null) return false;
+  const threshold = (maxAcceptAgeSec !== undefined && maxAcceptAgeSec !== null) ? Number(maxAcceptAgeSec) : Number(GLOBAL_MAX_ACCEPT_AGE_SEC);
+  if(ageSec > threshold) return false;
+
+    // initialize: fresh if not previously seen and age within threshold
+    if(kind === 'initialize'){
+  const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
+      return (prev === false);
+    }
+
+    // swap: require first-signature == currentSig and small block-time delta
+    if(kind === 'swap'){
+      if(!first || !first.sig) return false;
+      if(first.sig !== currentSig) return false;
+      if(!ft || !txBlockTime) return false;
+      const delta = Math.abs(Number(ft) - Number(txBlockTime));
+      if(delta > FIRST_SIG_MATCH_WINDOW_SECS) return false;
+  const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
+      return (prev === false);
+    }
+
+    // other kinds: accept only when tx indicates creation and not previously seen
+    const createdHere = isMintCreatedInThisTx(tx, mint);
+    if(createdHere){
+  const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
+      return (prev === false);
+    }
+    return false;
+  }catch(e){ return false; }
 }
 
 async function startSequentialListener(options){
@@ -436,68 +496,8 @@ async function startSequentialListener(options){
             for(const m of mints){
               try{
                 if(seenMints.has(m)) continue;
-                let accept = false;
-                // 1) Explicit initialize transactions — accept immediately if the mint is in the tx
-                if(kind === 'initialize'){
-                  accept = true;
-                } else if(kind === 'swap'){
-                  // 2) For swaps: by default accept only if this tx is the mint's first signature
-                  //    AND the firstSig's blockTime is close to txBlock (within FIRST_SIG_MATCH_WINDOW_SECS).
-                  //    Optionally allow accepting non-first-sig swap mints when the environment flag
-                  //    ALLOW_NON_FIRST_SWAP=true is set. In that case we accept when the tx
-                  //    explicitly references the mint (parsed info) or the mint appears created here
-                  //    and the mint was not previously seen.
-                  try{
-                    const first = await getFirstSignatureCached(m);
-                    if(first && first.sig && first.sig === sig){
-                      const ft = first.blockTime || null;
-                      if(ft && txBlock){
-                        const delta = Math.abs(Number(ft) - Number(txBlock));
-                        if(delta <= FIRST_SIG_MATCH_WINDOW_SECS){
-                          accept = true;
-                        }
-                      }
-                    } else {
-                      // optional relaxed acceptance for non-first-sig swaps
-                      try{
-                        const allowNonFirst = String(process.env.ALLOW_NON_FIRST_SWAP || 'false').toLowerCase() === 'true';
-                        if(allowNonFirst){
-                          // check whether tx explicitly references the mint in parsed instrs
-                          const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
-                          const instrs = (msg && msg.instructions) || [];
-                          let referencesFresh = false;
-                          for(const ins of instrs){
-                            try{
-                              const info = ins.parsed && ins.parsed.info;
-                              if(info){
-                                if(info.mint && String(info.mint) === String(m)) referencesFresh = true;
-                                if(info.source && String(info.source) === String(m)) referencesFresh = true;
-                                if(info.destination && String(info.destination) === String(m)) referencesFresh = true;
-                              }
-                            }catch(e){}
-                          }
-                          const createdHere = isMintCreatedInThisTx(tx, m);
-                          const prev = await mintPreviouslySeen(m, txBlock, sig).catch(() => true);
-                          if((referencesFresh || createdHere) && prev === false){
-                            accept = true;
-                          }
-                        }
-                      }catch(e){}
-                    }
-                  }catch(e){ /* ignore */ }
-                } else {
-                  // 3) For other kinds: only accept if there's a strong created-in-this-tx indicator AND it's fresh
-                  try{
-                    const createdHere = isMintCreatedInThisTx(tx, m);
-                    if(createdHere){
-                      // Strong creation indicator -> accept candidate and defer strict age filtering to user strategies.
-                      const prev = await mintPreviouslySeen(m, txBlock, sig);
-                      if(prev === false) accept = true;
-                      else console.error(`REJECT_PREVIOUS_SEEN mint=${m} prevSeen=true sig=${sig}`);
-                    }
-                  }catch(e){}
-                }
-                if(accept) fresh.push(m);
+                const freshOk = await isMintFresh(m, tx, txBlock, sig, kind).catch(()=>false);
+                if(freshOk) fresh.push(m);
               }catch(e){}
             }
             // Print up to 2 newest discovered fresh mints immediately to terminal with color
@@ -648,15 +648,24 @@ async function startSequentialListener(options){
                     const userMinAge = (userMinAgeRaw !== undefined && userMinAgeRaw !== null && !isNaN(Number(userMinAgeRaw))) ? Number(userMinAgeRaw) : null;
 
                     // Filter matched tokens by per-user age threshold when available
-                    const matchedFiltered = matched.filter(tok => {
-                      try{
-                        const age = (tok && tok._canonicalAgeSeconds != null) ? Number(tok._canonicalAgeSeconds) : (tok && tok.freshnessDetails && tok.freshnessDetails.firstTxMs ? getCanonicalAgeSeconds(Number(tok.freshnessDetails.firstTxMs) / 1000, null) : null);
-                        if(userMinAge !== null){
-                          return (age !== null && !isNaN(age) && age <= userMinAge);
-                        }
-                        return true;
-                      }catch(e){ return false; }
-                    });
+                    // Re-check freshness per-user using the centralized policy so prevSeen and first-sig
+                    // semantics are re-evaluated under the user's minAge threshold.
+                    let matchedFiltered = [];
+                    if(userMinAge !== null){
+                      const checks = await Promise.all((matched || []).map(async (tok) => {
+                        try{
+                          const mintAddr = tok && (tok.address||tok.tokenAddress||tok.mint);
+                          const txBlockSeconds = tok && tok.firstBlockTime ? (Number(tok.firstBlockTime) / 1000) : (tok && tok.txBlock ? Number(tok.txBlock) : null);
+                          const kindLocal = tok && tok.kind ? tok.kind : null;
+                          const sigLocal = tok && tok.sourceSignature ? tok.sourceSignature : null;
+                          const ok = await isMintFresh(mintAddr, null, txBlockSeconds, sigLocal, kindLocal, userMinAge).catch(()=>false);
+                          return ok ? tok : null;
+                        }catch(e){ return null; }
+                      }));
+                      matchedFiltered = (checks || []).filter(x=>x);
+                    } else {
+                      matchedFiltered = matched.slice(0);
+                    }
 
                     if(!Array.isArray(matchedFiltered) || matchedFiltered.length === 0) {
                       // nothing left after per-user filtering
@@ -794,125 +803,8 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
             for(const m of mints){
             if(collected.length >= maxCollect) break;
             if(seenMintsLocal.has(m)) continue;
-            let accept = false;
-            // allowAge is used in multiple branches below; compute once per-mint so it's in scope
-              // If caller provided maxAgeSec, enforce it; otherwise do not enforce a global age cutoff
-              const allowAge = (maxAgeSec !== undefined && maxAgeSec !== null) ? Number(maxAgeSec) : null;
-            if(kind === 'initialize'){
-              // treat initialize as a creation indicator but still require freshness and not previously seen
-              try{
-                  const first = await getFirstSignatureCached(m);
-                  const ft = first && first.blockTime ? first.blockTime : null;
-                  const ageSecInit = getCanonicalAgeSeconds(ft, txBlock);
-                  // If caller requested an explicit maxAgeSec, enforce it; otherwise defer age decision to per-user strategies
-                  if(allowAge !== null) {
-                        if(ageSecInit !== null && ageSecInit <= allowAge){
-                      const prevInit = await mintPreviouslySeen(m, txBlock, sig);
-                      if(prevInit === false) accept = true;
-                      else console.error(`REJECT_PREVIOUS_SEEN init mint=${m} prevSeen=true sig=${sig}`);
-                        } else {
-                          // age exceeded global threshold — decide behavior based on COLLECTOR_STRICT_AGE
-                          // prefer per-call override if provided, otherwise read env toggle
-                          const strict = (strictOverride !== undefined && strictOverride !== null) ? Boolean(strictOverride) : (String(process.env.COLLECTOR_STRICT_AGE ?? 'true').toLowerCase() !== 'false');
-                          if (strict) {
-                            try { console.error(`REJECT_AGE init mint=${m} age=${ageSecInit} sig=${sig} allowAge=${allowAge}`); } catch(e){}
-                            accept = false;
-                          } else {
-                            try { console.error(`DEFER_AGE_DECISION init mint=${m} age=${ageSecInit} sig=${sig} allowAge=${allowAge}`); } catch(e){}
-                            accept = true;
-                          }
-                        }
-                  } else {
-                    // no global age cutoff: accept candidate if not previously seen (delegate strict checks to user strategies)
-                    const prevInit = await mintPreviouslySeen(m, txBlock, sig);
-                    if(prevInit === false) accept = true;
-                  }
-              }catch(e){}
-            }
-            else if(kind === 'swap'){
-              try{
-                const first = await getFirstSignatureCached(m);
-                if(first && first.sig && first.sig === sig){
-                  const ft = first.blockTime || null;
-                  if(ft && txBlock){
-                    const delta = Math.abs(Number(ft) - Number(txBlock));
-                      if(delta <= FIRST_SIG_MATCH_WINDOW_SECS){
-                        const ageSec = getCanonicalAgeSeconds(ft, txBlock);
-                        // Enforce only if caller provided maxAgeSec; however we choose NOT to reject here.
-                        // If allowAge provided, still include candidate but mark for downstream decision.
-                        if(allowAge !== null){
-                              const strict = (strictOverride !== undefined && strictOverride !== null) ? Boolean(strictOverride) : (String(process.env.COLLECTOR_STRICT_AGE ?? 'true').toLowerCase() !== 'false');
-                              if (strict) {
-                                try { console.error(`REJECT_AGE swap mint=${m} age=${ageSec} sig=${sig} allowAge=${allowAge}`); } catch(e){}
-                                if(ageSec !== null && ageSec <= allowAge) accept = true; else accept = false;
-                              } else {
-                                try { console.error(`DEFER_AGE_DECISION swap mint=${m} age=${ageSec} sig=${sig} allowAge=${allowAge}`); } catch(e){}
-                                accept = true;
-                              }
-                            } else {
-                              accept = true;
-                            }
-                      }
-                  }
-                }
-              }catch(e){}
-              // If first-signature didn't match, support optional relaxed acceptance via env
-              try{
-                const allowNonFirst = String(process.env.ALLOW_NON_FIRST_SWAP || 'false').toLowerCase() === 'true';
-                if(!accept && allowNonFirst){
-                  // check parsed instruction references or creation heuristics and ensure mint not previously seen
-                  const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
-                  const instrs = (msg && msg.instructions) || [];
-                  let referencesFresh = false;
-                  for(const ins of instrs){
-                    try{
-                      const info = ins.parsed && ins.parsed.info;
-                      if(info){
-                        if(info.mint && String(info.mint) === String(m)) referencesFresh = true;
-                        if(info.source && String(info.source) === String(m)) referencesFresh = true;
-                        if(info.destination && String(info.destination) === String(m)) referencesFresh = true;
-                      }
-                    }catch(e){}
-                  }
-                  const createdHere = isMintCreatedInThisTx(tx, m);
-                  const prev = await mintPreviouslySeen(m, txBlock, sig).catch(() => true);
-                  if((referencesFresh || createdHere) && prev === false) accept = true;
-                }
-              }catch(e){}
-            } else {
-              try{
-                const createdHere = isMintCreatedInThisTx(tx, m);
-                  if(createdHere){
-                  const first = await getFirstSignatureCached(m);
-                  let ageSec = null;
-                  if(first && first.blockTime) ageSec = getCanonicalAgeSeconds(first.blockTime, txBlock);
-                  else if(txBlock) ageSec = getCanonicalAgeSeconds(null, txBlock);
-            try {
-              const prev = await mintPreviouslySeen(m, txBlock, sig);
-                if(prev === false) {
-                // If caller provided a global max age, enforce it at collector time unless configured otherwise.
-                if(allowAge !== null) {
-                  const strict = (strictOverride !== undefined && strictOverride !== null) ? Boolean(strictOverride) : (String(process.env.COLLECTOR_STRICT_AGE ?? 'true').toLowerCase() !== 'false');
-                  if (strict) {
-                    if(ageSec !== null && ageSec <= allowAge) {
-                      accept = true;
-                    } else {
-                      try { console.error(`REJECT_AGE created mint=${m} age=${ageSec} sig=${sig} allowAge=${allowAge}`); } catch(e){}
-                      accept = false;
-                    }
-                  } else {
-                    try { console.error(`DEFER_AGE_DECISION created mint=${m} age=${ageSec} sig=${sig} allowAge=${allowAge}`); } catch(e){}
-                    accept = true;
-                  }
-                } else {
-                  try { console.error(`DEFER_AGE_DECISION created mint=${m} age=${ageSec} sig=${sig}`); } catch(e){}
-                  accept = true;
-                }
-              }
-            } catch(e){}
-                }
-              }catch(e){}
-            }
+            // Use centralized freshness policy for collector: require isMintFresh true
+            const accept = await isMintFresh(m, tx, txBlock, sig, kind).catch(()=>false);
             if(accept){
               try{
                 // compute lightweight on-chain age fields for downstream consumers
@@ -979,3 +871,11 @@ module.exports.collectFreshMintsPerUser = collectFreshMintsPerUser;
 if (require.main === module) {
   startSequentialListener().catch(e => { console.error('Listener failed:', e && e.message || e); process.exit(1); });
 }
+
+// Export internal helpers for unit tests
+try{
+  module.exports.getCanonicalAgeSeconds = getCanonicalAgeSeconds;
+  module.exports.isMintFresh = isMintFresh;
+  module.exports.getFirstSignatureCached = getFirstSignatureCached;
+  module.exports.mintPreviouslySeen = mintPreviouslySeen;
+}catch(e){}
