@@ -8,7 +8,7 @@ import { loadUsers, loadUsersSync, saveUsers, walletKeyboard, getErrorMessage, l
 import { unifiedBuy, unifiedSell } from './src/tradeSources';
 import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades } from './src/bot/strategy';
 import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
-import { STRATEGY_FIELDS, notifyUsers, withTimeout } from './src/utils/tokenUtils';
+import { STRATEGY_FIELDS, notifyUsers, withTimeout, buildBulletedMessage } from './src/utils/tokenUtils';
 import { buildPreviewMessage } from './src/utils/tokenUtils';
 // Background enrich/queue disabled: listener-only operation per user requirement.
 import { registerBuySellHandlers } from './src/bot/buySellHandlers';
@@ -71,6 +71,28 @@ let users: Record<string, any> = {};
 console.log('--- Users placeholder created ---');
 let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
+let listenerStarted = false;
+
+async function ensureListenerStarted() {
+  try {
+    if (listenerStarted) return;
+    // start listener in background but do not block caller
+    const seq = require('./scripts/sequential_10s_per_program.js');
+    if (seq && typeof seq.startSequentialListener === 'function') {
+      (async () => {
+        try {
+          await seq.startSequentialListener();
+        } catch (e) {
+          try { console.error('[listener] failed to start (lazy):', e && (e.message || e)); } catch(_){}
+        }
+      })();
+      listenerStarted = true;
+      console.log('[listener] lazy startSequentialListener invoked');
+    }
+  } catch (e) {
+    try { console.warn('ensureListenerStarted error:', e); } catch(_){}
+  }
+}
 
 // Helper: decide if a given user should operate in listener-only (no enrichment) mode.
 function userIsListenerOnly(user: any) {
@@ -256,6 +278,8 @@ bot.hears('📊 Show Tokens', async (ctx) => {
   console.log(`[📊 Show Tokens] User: ${String(ctx.from?.id)}`);
   // Use the sequential listener's per-user collector to return an authoritative merged payload.
   try {
+  // Ensure the background listener is running (lazy start on first demand)
+  try { await ensureListenerStarted(); } catch (e) { /* ignore */ }
     const userId = String(ctx.from?.id);
     const user = users[userId] || {};
   // Determine effective age-only mode: per-user override or global default
@@ -273,27 +297,22 @@ bot.hears('📊 Show Tokens', async (ctx) => {
     // Run a single collection pass and get the merged payload for this user only
     const usersObj: Record<string, any> = {};
     usersObj[userId] = user;
-    const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect, timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride }).catch(() => ({}));
+  const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect, timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride, ageOnly: ageOnlyMode }).catch(() => ({}));
     const payload = collected && collected[userId] ? collected[userId] : null;
     if (!payload || !Array.isArray(payload.tokens) || payload.tokens.length === 0) {
       await ctx.reply('No live tokens found right now. Try again in a few seconds.');
       return;
     }
-    // Render the merged tokens payload (up to user's maxTrades)
-    const tokens = payload.tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
-    let text = `🔔 <b>Live tokens (listener)</b>\nFound ${payload.tokens.length} candidate(s) (showing ${tokens.length}):\n`;
-    for (const t of tokens) {
-      try {
-        const preview = buildPreviewMessage(t);
-        const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
-        text += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
-        try{ if(t && (t.sourceProgram || t.sourceSignature)){ text += `<i>من البرنامج: ${t.sourceProgram || '-'} sig: ${t.sourceSignature || '-'}</i>\n`; } }catch(e){}
-      } catch (e) {
-        const addr = t && (t.tokenAddress || t.address || t.mint) || 'unknown';
-        text += `• <code>${addr}</code>\n`;
-      }
-    }
-    await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true } as any));
+  // Render the merged tokens payload (up to user's maxTrades) using the bulleted template
+  const tokens = payload.tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
+  const { text, inline_keyboard } = buildBulletedMessage(tokens, { cluster: process.env.SOLANA_CLUSTER, title: 'Live tokens (listener)', maxShow: tokens.length });
+  // Log the bulleted message and keyboard for offline review/debugging before replying
+  try {
+    const tag = `[SHOW_TOKENS_MSG user=${userId}]`;
+    console.log(tag, text);
+    try { console.log(tag + ' inline_keyboard:', JSON.stringify(inline_keyboard, null, 2)); } catch (e) { console.log(tag + ' inline_keyboard (stringify failed)'); }
+  } catch (e) { /* ignore logging errors */ }
+  await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard } } as any));
   } catch (e) {
     console.error('[show_tokens] error', e && (e.message || e));
     try { await ctx.reply('Error fetching live tokens.'); } catch(_){}
@@ -653,13 +672,28 @@ console.log('--- About to launch bot ---');
                 toSend.push(a);
               }
               if(toSend.length===0) return;
-              // prefer pre-built HTML payload if present
+              // prefer pre-built HTML payload if present; otherwise build a bulleted message here
               try{
                 const chatId = uid;
-                if(userEvent.html && typeof userEvent.html === 'string'){
+                let html = userEvent && userEvent.html;
+                let inlineKeyboard = userEvent && userEvent.inlineKeyboard;
+                // If HTML missing, try to build a bulleted message from tokens using tokenUtils
+                if((!html || typeof html !== 'string' || html.length===0) && userEvent && Array.isArray(userEvent.tokens) && userEvent.tokens.length > 0){
+                  try{
+                    const tu = require('./src/utils/tokenUtils');
+                    if(tu && typeof tu.buildBulletedMessage === 'function'){
+                      const cluster = process.env.SOLANA_CLUSTER || 'mainnet';
+                      const title = `Live tokens (listener)`;
+                      const built = tu.buildBulletedMessage(userEvent.tokens, { cluster, title, maxShow: Math.min(10, userEvent.tokens.length) });
+                      if(built && built.text) html = built.text;
+                      if(built && built.inline_keyboard) inlineKeyboard = built.inline_keyboard;
+                    }
+                  }catch(e){}
+                }
+                if(html && typeof html === 'string' && html.length>0){
                   const options: any = ({ parse_mode: 'HTML', disable_web_page_preview: false } as any);
-                  if(userEvent.inlineKeyboard) options.reply_markup = { inline_keyboard: userEvent.inlineKeyboard };
-                  await (bot.telegram as any).sendMessage(chatId, userEvent.html, options).catch(()=>{});
+                  if(inlineKeyboard) options.reply_markup = { inline_keyboard: inlineKeyboard };
+                  await (bot.telegram as any).sendMessage(chatId, html, options).catch(()=>{});
                 } else {
                   // fallback: simple list message
                   let text = `🔔 <b>Matched tokens for your strategy</b>\nProgram: <code>${userEvent.program}</code>\nSignature: <code>${userEvent.signature}</code>\n\n`;
@@ -725,20 +759,64 @@ console.log('--- About to launch bot ---');
     // Register centralized buy/sell handlers now that users are loaded
     try { registerBuySellHandlers(bot, users, boughtTokens); } catch (e) { console.error('Failed to register buy/sell handlers:', e); }
 
-    await bot.launch();
-    console.log('✅ Bot launched successfully (polling)');
+    console.log('--- performing pre-launch connectivity check (getMe) ---');
+    try {
+      const me = await withTimeout(bot.telegram.getMe(), 5000, 'getMe');
+      try { const mm: any = me; console.log('--- Telegram getMe OK ---', (mm && mm.username) ? `@${mm.username}` : JSON.stringify(mm)); } catch(e) { console.log('--- Telegram getMe OK (username unknown) ---'); }
+    } catch (e) {
+      console.error('❌ Telegram getMe failed or timed out:', e && (e.message || e));
+      throw e;
+    }
+
+    // Decide whether to start Telegram polling (bot.launch).
+    // Default behavior: launch the bot so Telegram users can interact unless the
+    // operator explicitly sets SKIP_BOT_LAUNCH=true. LISTENER_ONLY_MODE controls
+    // internal behavior (no-disk/no-enrich) but SHOULD NOT silently disable the
+    // Telegram polling loop unless SKIP_BOT_LAUNCH is set. This makes the bot
+    // usable for Telegram users by default while preserving listener-only safety
+    // semantics for in-process operations.
+    const skipLaunch = (process.env.SKIP_BOT_LAUNCH === 'true');
+    if (skipLaunch) {
+      console.log('--- Skipping bot.launch() because SKIP_BOT_LAUNCH=true.');
+      console.log('--- The bot will still register handlers and start the in-process listener if available.');
+    } else {
+      if (LISTENER_ONLY_MODE) {
+        console.log('--- LISTENER_ONLY_MODE is active but SKIP_BOT_LAUNCH is not set; proceeding to launch the Telegram bot so users can interact.');
+        console.log('--- To run in pure listener-only mode (no polling), set SKIP_BOT_LAUNCH=true in the environment.');
+      } else {
+        console.log('--- launching bot: calling bot.launch() (will timeout after 15s for diagnostics) ---');
+      }
+      try {
+        // configurable timeout for bot.launch (ms)
+        const launchTimeout = Number(process.env.BOT_LAUNCH_TIMEOUT_MS || process.env.BOT_LAUNCH_TIMEOUT || 60000);
+        const retryTimeout = Math.min(launchTimeout * 2, 120000);
+        try {
+          // primary attempt with timeout
+          await withTimeout(bot.launch(), launchTimeout, 'bot-launch');
+          console.log('✅ Bot launched successfully (polling)');
+        } catch (err1) {
+          console.error('❌ Bot.launch attempt 1 failed or timed out:', err1 && (err1.message || err1));
+          try {
+            console.log(`--- Retrying bot.launch() with a longer timeout (${retryTimeout}ms) ---`);
+            await withTimeout(bot.launch(), retryTimeout, 'bot-launch-retry');
+            console.log('✅ Bot launched successfully on retry (polling)');
+          } catch (err2) {
+            console.error('❌ Bot.launch retry failed or timed out:', err2 && (err2.message || err2));
+            // Do not crash the whole process for transient Telegram/polling issues.
+            // Continue running the rest of the app (listener) so operator can diagnose.
+            console.warn('--- Continuing without active Telegram polling. Set SKIP_BOT_LAUNCH=true to run in pure listener-only mode.');
+          }
+        }
+      } catch (e) {
+        // Log any unexpected errors but continue so listener can run in-process
+        console.error('❌ Unexpected error during bot.launch sequence:', e && (e.message || e));
+      }
+    }
       try {
         // Start fast token fetcher to prioritize some users (1s polling)
   // Do NOT start fast token fetcher or enrich queue - listener is the single source of truth per requirement.
       // Start the sequential listener in-process so users receive live pushes from the listener
-      try{
-        const seq = require('./scripts/sequential_10s_per_program.js');
-        if(seq && typeof seq.startSequentialListener === 'function'){
-          // run listener without blocking (it manages its own loop)
-          (async ()=>{ try{ await seq.startSequentialListener(); }catch(e){ try{ console.error('[listener] failed to start:', e && e.message || e); }catch(_){} } })();
-          console.log('[listener] startSequentialListener invoked in-process');
-        }
-      }catch(e){ console.warn('Failed to start listener in-process:', e); }
+  // listener will be started lazily on user demand (first Show Tokens press)
       } catch (e) {
         console.warn('Failed to start fast token fetcher:', e);
       }
@@ -776,7 +854,9 @@ bot.command('show_token', async (ctx) => {
   try {
     // If user's numeric strategy fields are all zero/undefined, present listener/live candidates immediately
   const strategyRef = (user && user.strategy) ? user.strategy : {};
-    const numericKeys = ['minMarketCap','minLiquidity','minVolume','minAge'];
+  // For listener fast-path: consider only market-related numeric constraints.
+  // Age fields (minAge/maxAgeSec) do NOT count as blocking constraints — listener uses them uniquely.
+  const numericKeys = ['minMarketCap','minLiquidity','minVolume'];
     const hasNumericConstraint = numericKeys.some(k => {
       const v = strategyRef && (strategyRef as any)[k];
       return v !== undefined && v !== null && Number(v) > 0;
@@ -799,7 +879,7 @@ bot.command('show_token', async (ctx) => {
           const usersObj: Record<string, any> = {};
           usersObj[userId] = user;
           // Use per-user collector so user's strategy fields (minAge/maxAge) are applied at collection time
-          const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride }).catch(()=>({}));
+          const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride, ageOnly: true }).catch(()=>({}));
           const entry = collected && collected[userId] ? collected[userId] : null;
           tokens = (entry && Array.isArray(entry.tokens)) ? entry.tokens.map((it:any)=> Object.assign({ tokenAddress: it.mint || it.tokenAddress || it.address, address: it.mint || it.tokenAddress || it.address, mint: it.mint || it.tokenAddress || it.address, sourceCandidates: true, __listenerCollected: true }, it)) : [];
         }

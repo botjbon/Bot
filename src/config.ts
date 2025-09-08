@@ -1,5 +1,3 @@
-
-// إعدادات Birdeye
 import dotenv from 'dotenv';
 dotenv.config();
 

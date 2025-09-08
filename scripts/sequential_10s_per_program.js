@@ -368,22 +368,27 @@ async function mintPreviouslySeen(mint, txBlockTime, currentSig){
 // Ensures: (1) canonical age is available and <= GLOBAL_MAX_ACCEPT_AGE_SEC,
 // (2) first-signature semantics for swaps/initializes and not previously seen,
 // (3) when necessary, verifies creation-in-this-tx.
-async function isMintFresh(mint, tx, txBlockTime, currentSig, kind, maxAcceptAgeSec){
+async function isMintFresh(mint, tx, txBlockTime, currentSig, kind, maxAcceptAgeSec, ageOnly){
   try{
     if(!mint) return false;
     // compute canonical age using cached firstSig when possible
-  const getter = (module.exports && module.exports.getFirstSignatureCached) ? module.exports.getFirstSignatureCached : getFirstSignatureCached;
-  const prevChecker = (module.exports && module.exports.mintPreviouslySeen) ? module.exports.mintPreviouslySeen : mintPreviouslySeen;
-  const first = await getter(mint).catch(()=>null);
+    const getter = (module.exports && module.exports.getFirstSignatureCached) ? module.exports.getFirstSignatureCached : getFirstSignatureCached;
+    const prevChecker = (module.exports && module.exports.mintPreviouslySeen) ? module.exports.mintPreviouslySeen : mintPreviouslySeen;
+    const first = await getter(mint).catch(()=>null);
     const ft = first && first.blockTime ? first.blockTime : null;
     const ageSec = getCanonicalAgeSeconds(ft, txBlockTime);
     if(ageSec === null) return false;
-  const threshold = (maxAcceptAgeSec !== undefined && maxAcceptAgeSec !== null) ? Number(maxAcceptAgeSec) : Number(GLOBAL_MAX_ACCEPT_AGE_SEC);
-  if(ageSec > threshold) return false;
+    const threshold = (maxAcceptAgeSec !== undefined && maxAcceptAgeSec !== null) ? Number(maxAcceptAgeSec) : Number(GLOBAL_MAX_ACCEPT_AGE_SEC);
+    if(ageSec > threshold) return false;
+
+    // If caller requested age-only acceptance, skip first-sig / previously-seen / creation checks
+    if(ageOnly === true){
+      return true;
+    }
 
     // initialize: fresh if not previously seen and age within threshold
     if(kind === 'initialize'){
-  const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
+      const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
       return (prev === false);
     }
 
@@ -394,14 +399,14 @@ async function isMintFresh(mint, tx, txBlockTime, currentSig, kind, maxAcceptAge
       if(!ft || !txBlockTime) return false;
       const delta = Math.abs(Number(ft) - Number(txBlockTime));
       if(delta > FIRST_SIG_MATCH_WINDOW_SECS) return false;
-  const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
+      const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
       return (prev === false);
     }
 
     // other kinds: accept only when tx indicates creation and not previously seen
     const createdHere = isMintCreatedInThisTx(tx, mint);
     if(createdHere){
-  const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
+      const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
       return (prev === false);
     }
     return false;
@@ -615,7 +620,9 @@ async function startSequentialListener(options){
           // (no conditions, no enrichment). Otherwise run the normal strategy filter.
           let matched = [];
           try{
-            const numericKeys = ['minMarketCap','minLiquidity','minVolume','minAge'];
+            // Consider market-related numeric constraints when deciding listener bypass.
+            // Age-related fields are handled separately and should not prevent listener-only fast-path.
+            const numericKeys = ['minMarketCap','minLiquidity','minVolume'];
             const hasNumericConstraint = numericKeys.some(k => {
               const v = user.strategy && user.strategy[k];
               return v !== undefined && v !== null && Number(v) > 0;
@@ -658,7 +665,7 @@ async function startSequentialListener(options){
                           const txBlockSeconds = tok && tok.firstBlockTime ? (Number(tok.firstBlockTime) / 1000) : (tok && tok.txBlock ? Number(tok.txBlock) : null);
                           const kindLocal = tok && tok.kind ? tok.kind : null;
                           const sigLocal = tok && tok.sourceSignature ? tok.sourceSignature : null;
-                          const ok = await isMintFresh(mintAddr, null, txBlockSeconds, sigLocal, kindLocal, userMinAge).catch(()=>false);
+                          const ok = await isMintFresh(mintAddr, null, txBlockSeconds, sigLocal, kindLocal, userMinAge, true).catch(()=>false);
                           return ok ? tok : null;
                         }catch(e){ return null; }
                       }));
@@ -679,8 +686,18 @@ async function startSequentialListener(options){
                     // Build a Telegram-ready payload using tokenUtils if available
                     let payload = { time: userEvent.time, program: p, signature: sig, matched: matchAddrs, tokens: userEvent.candidateTokens };
                     try{
-                      if(_tokenUtils && typeof _tokenUtils.buildTokenMessage === 'function'){
-                        // build a preview for the first matched token to include rich HTML and keyboard
+                      // Prefer a full bulleted message (multiple tokens) when available
+                      if(_tokenUtils && typeof _tokenUtils.buildBulletedMessage === 'function' && Array.isArray(userEvent.candidateTokens) && userEvent.candidateTokens.length>0){
+                        try{
+                          const cluster = process.env.SOLANA_CLUSTER || 'mainnet';
+                          const title = `Live tokens (listener)`;
+                          const { text, inline_keyboard } = _tokenUtils.buildBulletedMessage(userEvent.candidateTokens, { cluster, title, maxShow: Math.min(10, userEvent.candidateTokens.length) });
+                          payload.html = text;
+                          payload.inlineKeyboard = inline_keyboard;
+                        }catch(e){}
+                      }
+                      // Fallback: single-token preview if bulleted builder not available
+                      if((!payload.html || payload.html.length===0) && _tokenUtils && typeof _tokenUtils.buildTokenMessage === 'function'){
                         const firstAddr = (userEvent.candidateTokens && userEvent.candidateTokens[0]) || null;
                         if(firstAddr){
                           const tokenObj = firstAddr; // already a lightweight token object
@@ -688,7 +705,7 @@ async function startSequentialListener(options){
                           const pairAddress = tokenObj.pairAddress || tokenObj.tokenAddress || tokenObj.address || tokenObj.mint || '';
                           try{
                             const built = _tokenUtils.buildTokenMessage(tokenObj, botUsername, pairAddress, uid);
-                            if(built && built.msg){ payload.html = built.msg; payload.inlineKeyboard = built.inlineKeyboard || (built.inlineKeyboard ? built.inlineKeyboard : built.inlineKeyboard); }
+                            if(built && built.msg){ payload.html = built.msg; payload.inlineKeyboard = built.inlineKeyboard || built.inlineKeyboard; }
                           }catch(e){}
                         }
                       }
@@ -780,7 +797,7 @@ module.exports.startSequentialListener = startSequentialListener;
 // Lightweight one-shot collector: run the minimal discovery loop until we collect
 // `maxCollect` fresh mints or `timeoutMs` elapses. Returns an array of mint addresses.
 // Collector: try to give enough time to iterate all configured programs by default
-async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || Math.max(20000, PER_PROGRAM_DURATION_MS * (PROGRAMS.length || 1) + 5000)), maxAgeSec = undefined, strictOverride = false } = {}){
+async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || Math.max(20000, PER_PROGRAM_DURATION_MS * (PROGRAMS.length || 1) + 5000)), maxAgeSec = undefined, strictOverride = false, ageOnly = false } = {}){
   const collected = [];
   const seenMintsLocal = new Set();
   const stopAt = Date.now() + (Number(timeoutMs) || 20000);
@@ -788,8 +805,9 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
     for(const p of PROGRAMS){
       if(Date.now() > stopAt) break;
       try{
-        const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: SIG_BATCH_LIMIT }]);
-        if(!Array.isArray(sigs) || sigs.length===0) continue;
+    const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: SIG_BATCH_LIMIT }]);
+    try{ console.error(`[LISTENER_DEBUG prog=${p}] signatures=${Array.isArray(sigs)?sigs.length:0}`); }catch(e){}
+    if(!Array.isArray(sigs) || sigs.length===0) continue;
         for(const s of sigs){
           if(Date.now() > stopAt) break;
           const sig = getSig(s); if(!sig) continue;
@@ -804,7 +822,40 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
             if(collected.length >= maxCollect) break;
             if(seenMintsLocal.has(m)) continue;
             // Use centralized freshness policy for collector: require isMintFresh true
-            const accept = await isMintFresh(m, tx, txBlock, sig, kind).catch(()=>false);
+            const accept = await isMintFresh(m, tx, txBlock, sig, kind, maxAgeSec, ageOnly).catch(()=>false);
+            if(!accept){
+              try{
+                const firstCached = await getFirstSignatureCached(m).catch(()=>null);
+                const ft = firstCached && firstCached.blockTime ? firstCached.blockTime : null;
+                const ageSec = getCanonicalAgeSeconds(ft, txBlock);
+                const threshold = (maxAgeSec !== undefined && maxAgeSec !== null) ? Number(maxAgeSec) : Number(GLOBAL_MAX_ACCEPT_AGE_SEC);
+                let reason = 'unknown';
+                if(ageSec === null) reason = 'no-age';
+                else if(ageSec > threshold) reason = 'too-old';
+                else {
+                  // attempt to mirror swap/initialize checks
+                  if(kind === 'initialize'){
+                    const prev = await mintPreviouslySeen(m, txBlock, sig).catch(()=>true);
+                    reason = prev ? 'previously-seen' : 'init-failed';
+                  } else if(kind === 'swap'){
+                    if(!firstCached || !firstCached.sig) reason = 'no-first-sig';
+                    else if(firstCached.sig !== sig) reason = 'first-sig-mismatch';
+                    else {
+                      if(!ft || !txBlock) reason = 'no-block-times';
+                      else {
+                        const delta = Math.abs(Number(ft) - Number(txBlock));
+                        if(delta > FIRST_SIG_MATCH_WINDOW_SECS) reason = 'blocktime-delta';
+                        else {
+                          const prev = await mintPreviouslySeen(m, txBlock, sig).catch(()=>true);
+                          reason = prev ? 'previously-seen' : 'swap-failed';
+                        }
+                      }
+                    }
+                  }
+                }
+                console.error(`COLLECT_DEBUG reject program=${p} kind=${kind} mint=${m} age=${ageSec} threshold=${threshold} reason=${reason} sig=${sig}`);
+              }catch(e){ console.error(`COLLECT_DEBUG reject program=${p} mint=${m} reason=debug-failed`); }
+            }
             if(accept){
               try{
                 // compute lightweight on-chain age fields for downstream consumers
@@ -843,25 +894,80 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
 }
 module.exports.collectFreshMints = collectFreshMints;
 // Helper: collect once and return per-user merged payloads filtered by each user's strategy
-async function collectFreshMintsPerUser(usersObj = {}, { maxCollect = 10, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || 20000), strictOverride = false } = {}){
-  // Run a single collector pass (no global maxAgeSec) to gather candidates with ages
-  const collected = await collectFreshMints({ maxCollect, timeoutMs, maxAgeSec: undefined, strictOverride });
+async function collectFreshMintsPerUser(usersObj = {}, { maxCollect = 10, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || 20000), strictOverride = false, ageOnly = false } = {}){
+  // Determine the maximal per-user age threshold (seconds) to pass into the collector
+  // so the centralized freshness checks honor user-configured age windows.
+  let maxUserAge = undefined;
+  try{
+    for(const uid of Object.keys(usersObj || {})){
+      try{
+        const user = usersObj[uid] || {};
+        let rawAge = (user && user.strategy && (user.strategy.maxAgeSec !== undefined)) ? user.strategy.maxAgeSec : (user && user.strategy ? user.strategy.minAge : undefined);
+        if(rawAge === undefined || rawAge === null){
+          // try parse legacy durations if tokenUtils available
+          if(_tokenUtils && typeof _tokenUtils.parseDuration === 'function' && rawAge !== undefined && rawAge !== null){
+            rawAge = _tokenUtils.parseDuration(rawAge);
+          }
+        }
+        const num = (rawAge !== undefined && rawAge !== null && !Number.isNaN(Number(rawAge))) ? Number(rawAge) : undefined;
+        if(typeof num === 'number' && !isNaN(num)){
+          if(maxUserAge === undefined || num > maxUserAge) maxUserAge = num;
+        }
+      }catch(e){}
+    }
+  }catch(e){}
+
+  try{ console.error(`[LISTENER_DEBUG] collectFreshMintsPerUser using maxUserAge=${String(maxUserAge)} for users=${Object.keys(usersObj||{}).length}`); }catch(e){}
+  // Run a single collector pass with maxAgeSec set to the largest per-user threshold found
+  const collected = await collectFreshMints({ maxCollect, timeoutMs, maxAgeSec: maxUserAge, strictOverride, ageOnly });
+  try{ console.error(`[LISTENER_DEBUG] collected candidates=${Array.isArray(collected)?collected.length:0} for users=${Object.keys(usersObj||{}).length}`); }catch(e){}
   const result = {};
   for(const uid of Object.keys(usersObj || {})){
     try{
       const user = usersObj[uid] || {};
-      const userMinAgeRaw = user && user.strategy ? user.strategy.minAge : undefined;
-      const userMinAge = (userMinAgeRaw !== undefined && userMinAgeRaw !== null && !Number.isNaN(Number(userMinAgeRaw))) ? Number(userMinAgeRaw) : null;
+  // ...production: no test-injection hooks here (inject test tokens only during local dev/debug runs)
+      // Allow both `maxAgeSec` (preferred) and legacy `minAge` as the user's age threshold
+      const rawAge = (user && user.strategy && (user.strategy.maxAgeSec !== undefined)) ? user.strategy.maxAgeSec : (user && user.strategy ? user.strategy.minAge : undefined);
+      let userAgeThreshold = null;
+      try{
+        if(rawAge !== undefined && rawAge !== null && !Number.isNaN(Number(rawAge))){
+          userAgeThreshold = Number(rawAge);
+        } else if(_tokenUtils && typeof _tokenUtils.parseDuration === 'function' && rawAge !== undefined && rawAge !== null){
+          const parsed = _tokenUtils.parseDuration(rawAge);
+          if(parsed !== undefined && parsed !== null && !Number.isNaN(Number(parsed))) userAgeThreshold = Number(parsed);
+        }
+      }catch(e){}
+      try{ console.error(`[LISTENER_DEBUG] user=${uid} rawAge=${String(rawAge)} userAgeThreshold=${String(userAgeThreshold)}`); }catch(e){}
       const tokens = (Array.isArray(collected) ? collected : []).filter(t => {
         try{
           const age = (t && t._canonicalAgeSeconds != null) ? Number(t._canonicalAgeSeconds) : null;
-          if(userMinAge !== null){
-            return (age !== null && !isNaN(age) && age <= userMinAge);
+          if(userAgeThreshold !== null){
+            return (age !== null && !isNaN(age) && age <= userAgeThreshold);
           }
           return true;
         }catch(e){ return false; }
       }).slice(0, 10);
+      try{ console.error(`[LISTENER_DEBUG] user=${uid} matched_after_age_filter=${tokens.length}`); }catch(e){}
       result[uid] = { user: String(uid), matched: tokens.map(t => t.mint), tokens };
+      // If there are accepted tokens for this user, print them immediately using the bulleted message template
+      try{
+        if(Array.isArray(tokens) && tokens.length > 0){
+          if(_tokenUtils && typeof _tokenUtils.buildBulletedMessage === 'function'){
+            try{
+              const cluster = process.env.SOLANA_CLUSTER || 'mainnet';
+              const title = `Live tokens (listener) for ${uid}`;
+              const { text, inline_keyboard } = _tokenUtils.buildBulletedMessage(tokens, { cluster, title, maxShow: tokens.length });
+              // Print formatted HTML message to stderr (so logs and collectors can capture it)
+              console.error(`[LISTENER_MSG user=${uid}]`);
+              console.error(text);
+              try{ console.error('[LISTENER_MSG inline_keyboard]', JSON.stringify(inline_keyboard)); }catch(e){}
+            }catch(e){ console.error(`[LISTENER_MSG user=${uid}] buildBulletedMessage failed: ${String(e)}`); }
+          } else {
+            // fallback: simple list output
+            try{ console.error(`[LISTENER_MSG user=${uid}] accepted tokens: ${tokens.map(t => (t && (t.mint || t.tokenAddress || t.address)) || String(t)).join(', ')}`); }catch(e){}
+          }
+        }
+      }catch(e){}
     }catch(e){ result[uid] = { user: String(uid), matched: [], tokens: [] }; }
   }
   return result;

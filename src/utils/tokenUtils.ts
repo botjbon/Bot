@@ -1296,6 +1296,63 @@ export function buildPreviewMessage(token: any): { title: string; addr: string; 
   return { title: name, addr, price, url, shortMsg };
 }
 
+// Build a bulleted HTML message and inline keyboard for a list of tokens.
+// Uses the full `buildTokenMessage` template for each token so multi-token
+// notifications show the same rich block that single-token messages use.
+export function buildBulletedMessage(tokens: any[], opts?: { cluster?: string; title?: string; maxShow?: number; program?: string; signature?: string }) {
+  const cluster = opts?.cluster || process.env.SOLANA_CLUSTER || 'mainnet';
+  const title = opts?.title || 'Live tokens (listener)';
+  const maxShow = opts?.maxShow ?? (Array.isArray(tokens) ? tokens.length : 0);
+
+  const program = opts?.program || (Array.isArray(tokens) && tokens.length && (tokens[0].program || tokens[0].sourceProgram)) || undefined;
+  const signature = opts?.signature || (Array.isArray(tokens) && tokens.length && (tokens[0].signature || tokens[0].sourceSignature)) || undefined;
+
+  // Header
+  let text = `🔔 <b>${title}${opts && (opts as any).forUser ? ' for ' + (opts as any).forUser : ''}</b>\nFound ${Array.isArray(tokens) ? tokens.length : 0} candidate(s) (showing ${Math.min(Array.isArray(tokens) ? tokens.length : 0, maxShow)}):\n`;
+  if (program) text += `Program: <code>${program}</code>\n`;
+  if (signature) text += `Signature: <code>${signature}</code>\n`;
+
+  const inline_keyboard: any[][] = [];
+
+  const botUsername = process.env.BOT_USERNAME || 'YourBotUsername';
+
+  for (let i = 0; i < Math.min(Array.isArray(tokens) ? tokens.length : 0, maxShow); i++) {
+    const t = tokens[i];
+    try {
+      // Use the rich single-token template for each token
+      const pairAddress = t.pairAddress || t.tokenAddress || t.address || t.mint || '';
+      const built = buildTokenMessage(t, botUsername, pairAddress, undefined);
+      if (built && typeof built.msg === 'string') {
+        // Separate items with two newlines for readability
+        text += `\n• ${built.msg}\n`;
+      } else {
+        // Fallback to preview line
+        const preview = buildPreviewMessage(t);
+        const addr = preview.addr || '<unknown>';
+        text += `\n• <b>${preview.title}</b> <code>${addr}</code>\n${preview.shortMsg}\n`;
+      }
+      // Merge inline keyboard rows if present
+      if (built && Array.isArray(built.inlineKeyboard)) {
+        for (const row of built.inlineKeyboard) {
+          if (Array.isArray(row) && row.length) inline_keyboard.push(row);
+        }
+      } else if (pairAddress) {
+        // fallback: add an explorer button row
+        const explorerBase = (cluster === 'devnet') ? 'https://explorer.solana.com' : 'https://explorer.solana.com';
+        inline_keyboard.push([{ text: `🔎 ${t.name || pairAddress}`, url: `${explorerBase}/address/${pairAddress}?cluster=${cluster}` }]);
+      }
+    } catch (e) {
+      const addr = t && (t.tokenAddress || t.address || t.mint) || 'unknown';
+      text += `\n• <code>${addr}</code>\n`;
+      const explorerBase = (cluster === 'devnet') ? 'https://explorer.solana.com' : 'https://explorer.solana.com';
+      inline_keyboard.push([{ text: `🔎 ${addr}`, url: `${explorerBase}/address/${addr}?cluster=${cluster}` }]);
+    }
+  }
+
+  return { text, inline_keyboard };
+}
+
+
 function progressBar(percent: number, size = 10, fill = '█', empty = '░') {
   const filled = Math.round((percent / 100) * size);
   return fill.repeat(filled) + empty.repeat(size - filled);
@@ -1309,27 +1366,47 @@ export async function notifyUsers(bot: any, users: Record<string, any>, tokens: 
     const filteredVerbose = autoFilterTokensVerbose(tokens, strategy);
     const filtered = (filteredVerbose && filteredVerbose.passed) ? filteredVerbose.passed : (Array.isArray(filteredVerbose) ? filteredVerbose : tokens);
     if (filtered && filtered.length > 0 && bot) {
-      for (const token of filtered) {
-        const chain = (token.chainId || token.chain || token.chainName || '').toString().toLowerCase();
-        if (chain && !chain.includes('sol')) continue;
+      // Filter to Solana tokens only
+      const solFiltered = filtered.filter((token: any) => {
+        try { const chain = (token.chainId || token.chain || token.chainName || '').toString().toLowerCase(); return !chain || chain.includes('sol'); } catch (e) { return true; }
+      });
+      if (solFiltered.length === 0) {
+        // nothing for this chain
+      } else if (solFiltered.length === 1) {
+        const token = solFiltered[0];
         let botUsername = (bot && bot.botInfo && bot.botInfo.username) ? bot.botInfo.username : (process.env.BOT_USERNAME || 'YourBotUsername');
         const address = token.tokenAddress || token.address || token.mint || token.pairAddress || 'N/A';
         const pairAddress = token.pairAddress || address;
-        const { msg, inlineKeyboard } = buildTokenMessage(token, botUsername, pairAddress);
-        // Extra protection: if msg is not a string, skip sending
-        if (typeof msg !== 'string') {
+        const singleMsg = buildTokenMessage(token, botUsername, pairAddress);
+        if (typeof singleMsg.msg !== 'string') {
           await bot.telegram.sendMessage(uid, '⚠️ We are still looking for the gems you want.');
-          continue;
+        } else {
+          await bot.telegram.sendMessage(uid, singleMsg.msg, ({ parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard: singleMsg.inlineKeyboard } } as any));
         }
-  // cast options to any to satisfy differing telegram typings
-  await bot.telegram.sendMessage(uid, msg, ({ parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard: inlineKeyboard } } as any));
+      } else {
+        // Multiple tokens: send a single bulleted message with inline buttons
+        try {
+          const { text, inline_keyboard } = buildBulletedMessage(solFiltered, { cluster: process.env.SOLANA_CLUSTER, title: 'Tokens matching your strategy', maxShow: solFiltered.length });
+          await bot.telegram.sendMessage(uid, text, ({ parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard } } as any));
+        } catch (e) {
+          // fallback: send individual messages
+          for (const token of solFiltered) {
+            try {
+              let botUsername = (bot && bot.botInfo && bot.botInfo.username) ? bot.botInfo.username : (process.env.BOT_USERNAME || 'YourBotUsername');
+              const address = token.tokenAddress || token.address || token.mint || token.pairAddress || 'N/A';
+              const pairAddress = token.pairAddress || address;
+              const singleMsg = buildTokenMessage(token, botUsername, pairAddress);
+              if (typeof singleMsg.msg === 'string') await bot.telegram.sendMessage(uid, singleMsg.msg, ({ parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard: singleMsg.inlineKeyboard } } as any));
+            } catch (e2) {}
+          }
+        }
       }
     } else if (bot) {
-      await bot.telegram.sendMessage(
-        uid,
-        'No tokens currently match your strategy.\n\nYour strategy filters may be too strict for the available data from DexScreener.\n\nTry lowering requirements like liquidity, market cap, volume, age, or holders, then try again.',
-  ({ parse_mode: 'HTML', disable_web_page_preview: true } as any)
-      );
+              await bot.telegram.sendMessage(
+                uid,
+                'No tokens currently match your strategy.\n\nYour strategy filters may be too strict for the available data from DexScreener.\n\nTry lowering requirements like liquidity, market cap, volume, age, or holders, then try again.',
+          ({ parse_mode: 'HTML', disable_web_page_preview: true } as any)
+              );
     }
   }
 }
