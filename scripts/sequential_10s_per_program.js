@@ -40,6 +40,12 @@ const INMEM_NOTIF_MAX = Number(process.env.NOTIF_INMEM_MAX || 50);
 // optional helper: attempt to require message builder
 let _tokenUtils = null;
 try{ _tokenUtils = require('../src/utils/tokenUtils'); }catch(e){}
+// Minimal output mode: when true, suppress noisy logs and only print the compact
+// token array and the JSON payload per discovery. Controlled via env var.
+let MINIMAL_OUTPUT = String(process.env.LISTENER_MINIMAL_OUTPUT || '').toLowerCase() === 'true';
+// When true: only print explicit-created mints (those with clear Initialize/Create markers)
+// Make mutable so callers can override at runtime via startSequentialListener(options)
+let ONLY_PRINT_EXPLICIT = String(process.env.ONLY_PRINT_EXPLICIT || '').toLowerCase() === 'true';
 
 const PROGRAMS = [
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
@@ -322,24 +328,27 @@ function isMintCreatedInThisTx(tx, mint){
     if(!tx) return false;
     const logs = joinTxLogs(tx);
     const m = String(mint).toLowerCase();
-    // common log markers
-    if(logs.includes('instruction: initializemint') || logs.includes('initialize mint') || logs.includes('initialize_mint') || logs.includes('createidempotent')) return true;
-    // sometimes log messages include the mint address when created
-    if(m && logs.includes(m)) return true;
-    // inspect parsed instructions for initialize mint
+    // Strict detection: require BOTH a log marker indicating a create/initialize
+    // AND a parsed instruction that references the mint address (info.mint or info.newAccount).
+    // This avoids treating swap/pool logs or incidental mentions as explicit mint creations.
+    const hasLogMarker = !!(logs && logs.match(/initializemint|initialize mint|initialize_mint|createidempotent|instruction:\s*create/));
+    // inspect parsed instructions for explicit mint/newAccount references
+    let parsedMatches = false;
     const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
     const instrs = (msg && msg.instructions) || [];
     for(const ins of instrs){
       try{
         const t = (ins.parsed && ins.parsed.type) || (ins.type || '');
-        if(t && String(t).toLowerCase().includes('initializemint')) return true;
+        if(t && String(t).toLowerCase().includes('initializemint')) parsedMatches = true;
         const info = ins.parsed && ins.parsed.info;
         if(info){
-          if(info.mint && String(info.mint).toLowerCase() === m) return true;
-          if(info.newAccount && String(info.newAccount).toLowerCase() === m) return true;
+          if(info.mint && String(info.mint).toLowerCase() === m) parsedMatches = true;
+          if(info.newAccount && String(info.newAccount).toLowerCase() === m) parsedMatches = true;
         }
       }catch(e){}
     }
+    // require both a parsed reference and a log marker to qualify as an explicit creation
+    return parsedMatches && hasLogMarker;
   }catch(e){}
   return false;
 }
@@ -388,6 +397,9 @@ async function isMintFresh(mint, tx, txBlockTime, currentSig, kind, maxAcceptAge
 
     // initialize: fresh if not previously seen and age within threshold
     if(kind === 'initialize'){
+      // require strong evidence that the mint was created in this tx
+      const createdHere = isMintCreatedInThisTx(tx, mint);
+      if(!createdHere) return false;
       const prev = await prevChecker(mint, txBlockTime, currentSig).catch(()=>true);
       return (prev === false);
     }
@@ -414,10 +426,12 @@ async function isMintFresh(mint, tx, txBlockTime, currentSig, kind, maxAcceptAge
 }
 
 async function startSequentialListener(options){
-  console.error('Sequential 10s per-program listener starting (daemon mode)');
+  // allow caller to override explicit-only behavior at runtime
+  try{ if(options && typeof options.onlyPrintExplicit !== 'undefined') ONLY_PRINT_EXPLICIT = Boolean(options.onlyPrintExplicit); }catch(e){}
+  if(!ONLY_PRINT_EXPLICIT) console.error('Sequential 10s per-program listener starting (daemon mode)');
   const seenMints = new Set();
   let stopped = false;
-  process.on('SIGINT', () => { console.error('SIGINT received, stopping listener...'); stopped = true; });
+  process.on('SIGINT', () => { if(!ONLY_PRINT_EXPLICIT) console.error('SIGINT received, stopping listener...'); stopped = true; });
   // Load and cache users once; watch file for changes to avoid reading on every match
   const usersPath = path.join(process.cwd(), 'users.json');
   let users = {};
@@ -432,7 +446,7 @@ async function startSequentialListener(options){
       try{ if(users[k] && users[k].strategy) users[k].strategy = normalize(users[k].strategy); }catch(e){}
     }
   }catch(e){}
-  try{ fs.watchFile(usersPath, { interval: 2000 }, () => { loadUsers(); console.error('users.json reloaded'); }); }catch(e){}
+  try{ fs.watchFile(usersPath, { interval: 2000 }, () => { loadUsers(); if(!ONLY_PRINT_EXPLICIT) console.error('users.json reloaded'); }); }catch(e){}
   // require strategy filter once to avoid repeated module resolution cost
   let strategyFilter = null;
   try{ strategyFilter = require('../src/bot/strategy').filterTokensByStrategy; }catch(e){ strategyFilter = null; }
@@ -445,7 +459,7 @@ async function startSequentialListener(options){
       if (stopped) break;
       try{
         const rule = RULES[p] || RULES.default;
-        console.error(`[${p}] listening (10s)`);
+  if(!ONLY_PRINT_EXPLICIT) console.error(`[${p}] listening (10s)`);
   // use configured per-program duration so the listener respects PER_PROGRAM_DURATION_MS
   const end = Date.now() + (Number(process.env.PER_PROGRAM_DURATION_MS) || PER_PROGRAM_DURATION_MS);
         const seenTxs = new Set();
@@ -454,8 +468,8 @@ async function startSequentialListener(options){
           try{
             // Don't skip programs that have empty allow lists; continue but ensure we don't miss explicit initialize events
             if(!rule || !Array.isArray(rule.allow)) break;
-      // fetch a small batch of recent signatures to process any new ones
-      const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: SIG_BATCH_LIMIT }]);
+          // fetch a small batch of recent signatures to process any new ones
+  const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: SIG_BATCH_LIMIT }]);
             if(!Array.isArray(sigs)||sigs.length===0){ await sleep(250); continue; }
             // process newest first
             let s = sigs[0];
@@ -487,11 +501,11 @@ async function startSequentialListener(options){
                 const fileName = Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.json';
                 const filePath = path.join(outDir, fileName);
                 fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
-                console.error('CAPTURED', filePath);
+                if(!ONLY_PRINT_EXPLICIT) console.error('CAPTURED', filePath);
                 // update seen set and collector so consumer won't reprocess the same mints
                 for(const m of mints) seenMints.add(m);
                 for(const m of mints){ if(LATEST_COLLECTED.length < COLLECT_MAX && !LATEST_COLLECTED.includes(m)) LATEST_COLLECTED.push(m); }
-                if(LATEST_COLLECTED.length >= COLLECT_MAX){ try{ console.error('COLLECTED_FINAL', JSON.stringify(LATEST_COLLECTED.slice(0, COLLECT_MAX))); console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() })); if(EXIT_ON_COLLECT){ console.error('Exiting because COLLECT_MAX reached'); process.exit(0); } }catch(e){} }
+                if(LATEST_COLLECTED.length >= COLLECT_MAX){ try{ if(!ONLY_PRINT_EXPLICIT) { console.error('COLLECTED_FINAL', JSON.stringify(LATEST_COLLECTED.slice(0, COLLECT_MAX))); console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() })); if(EXIT_ON_COLLECT){ console.error('Exiting because COLLECT_MAX reached'); } } if(EXIT_ON_COLLECT){ try{ process.exit(0); }catch(e){} } }catch(e){} }
               }catch(e){}
               await sleep(120);
               continue;
@@ -508,14 +522,20 @@ async function startSequentialListener(options){
             // Print up to 2 newest discovered fresh mints immediately to terminal with color
             try{
               if(Array.isArray(fresh) && fresh.length>0){
-                const latest = fresh.slice(0,2);
-                // header (plain)
-                console.log(`FRESH_MINTS [program=${p}] [sig=${sig}] [kind=${kind}]`);
-                // colored JSON for the array (yellow)
-                try{
-                  console.log('\x1b[33m%s\x1b[0m', JSON.stringify(latest, null, 2));
-                }catch(e){ console.log('\x1b[33m%s\x1b[0m', String(latest)); }
-              }
+                  const latest = fresh.slice(0,2);
+                  // If ONLY_PRINT_EXPLICIT is set, require explicit creation for printing; otherwise behave as before
+                  const shouldPrintArray = !ONLY_PRINT_EXPLICIT || latest.some(m => isMintCreatedInThisTx(tx, m));
+                  if(shouldPrintArray){
+                    if(!MINIMAL_OUTPUT && !ONLY_PRINT_EXPLICIT) console.log(`FRESH_MINTS [program=${p}] [sig=${sig}] [kind=${kind}]`);
+                    try{
+                      if(MINIMAL_OUTPUT) {
+                        console.log(JSON.stringify(latest));
+                      } else {
+                        console.log('\x1b[33m%s\x1b[0m', JSON.stringify(latest, null, 2));
+                      }
+                    }catch(e){ if(MINIMAL_OUTPUT) { console.log(JSON.stringify(latest)); } else { console.log('\x1b[33m%s\x1b[0m', String(latest)); } }
+                  }
+                }
             }catch(e){}
             if(fresh.length===0) { await sleep(250); continue; }
             if(kind==='swap'){
@@ -541,8 +561,19 @@ async function startSequentialListener(options){
             for(const m of fresh) seenMints.add(m);
             // Emit global event for listeners (no DEX enrichment)
             const globalEvent = { time:new Date().toISOString(), program:p, signature:sig, kind: kind, freshMints:fresh.slice(0,5), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) };
-            // No optional raw enrichment (PRINT_RAW_FRESH removed) — keep events lightweight
-            console.log(JSON.stringify(globalEvent));
+              // No optional raw enrichment (PRINT_RAW_FRESH removed) — keep events lightweight
+              // Print full JSON payload only when we have strict explicit evidence or when not in ONLY_PRINT_EXPLICIT mode.
+            try{
+              const anyExplicit = Array.isArray(globalEvent.sampleLogs) && globalEvent.sampleLogs.join('\n').toLowerCase().match(/initializemint|initialize mint|initialize_mint|instruction:\s*create/);
+              // Ensure parsed instruction also references the mint(s) when ONLY_PRINT_EXPLICIT is active
+              let parsedRefers = false;
+              if(Array.isArray(globalEvent.freshMints) && globalEvent.freshMints.length>0){
+                const txObj = tx;
+                for(const fm of globalEvent.freshMints){ if(isMintCreatedInThisTx(txObj, fm)) { parsedRefers = true; break; } }
+              }
+              const shouldPrintGlobal = (!ONLY_PRINT_EXPLICIT) || (anyExplicit && parsedRefers);
+              if(shouldPrintGlobal){ console.log(JSON.stringify(globalEvent)); }
+            }catch(e){}
             // If capture-only mode is enabled, write a tiny capture file and skip enrichment
             if(CAPTURE_ONLY){
               try{
@@ -552,7 +583,7 @@ async function startSequentialListener(options){
                 const fileName = Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.json';
                 const filePath = path.join(outDir, fileName);
                 fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
-                console.error('CAPTURED', filePath);
+                if(!ONLY_PRINT_EXPLICIT) console.error('CAPTURED', filePath);
               }catch(e){}
               // still update collector and seen set but skip heavy enrichment
               try{ for(const m of fresh) seenMints.add(m); }catch(e){}
@@ -567,11 +598,16 @@ async function startSequentialListener(options){
               }
               if(LATEST_COLLECTED.length >= COLLECT_MAX){
                 try{
-                  console.error('COLLECTED_FINAL', JSON.stringify(LATEST_COLLECTED.slice(0, COLLECT_MAX)));
-                  console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() }));
+                  // In minimal mode avoid verbose label around collected final and only print the JSON object
+                  if(MINIMAL_OUTPUT){
+                    if(!ONLY_PRINT_EXPLICIT) console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() }));
+                  } else {
+                    if(!ONLY_PRINT_EXPLICIT) console.error('COLLECTED_FINAL', JSON.stringify(LATEST_COLLECTED.slice(0, COLLECT_MAX)));
+                    if(!ONLY_PRINT_EXPLICIT) console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() }));
+                  }
                 }catch(e){}
                 if(EXIT_ON_COLLECT){
-                  try{ console.error('Exiting because COLLECT_MAX reached'); }catch(e){}
+                  try{ if(!ONLY_PRINT_EXPLICIT) console.error('Exiting because COLLECT_MAX reached'); }catch(e){}
                   process.exit(0);
                 }
               }
@@ -586,8 +622,17 @@ async function startSequentialListener(options){
               // Lightweight on-chain enrichment: fetch the first signature for each mint to derive a first-tx timestamp (cheap, 1 RPC per mint)
                 const candidateTokens = await Promise.all(fresh.map(async (m) => {
                 const mintAddr = m;
+                // basic validation: ensure this looks like a real Solana public key and not a program id or malformed string
+                try{
+                  const { PublicKey } = require('@solana/web3.js');
+                  const pk = new PublicKey(mintAddr);
+                  const normalized = pk.toBase58();
+                  // reject obvious program ids or denied addresses
+                  if(!normalized || DENY.has(normalized) || PROGRAMS.includes(normalized)) return null;
+                }catch(e){ return null; }
                 // include listener source metadata so strategy filters can preserve/inspect realtime origin
                 const tok = { address: mintAddr, tokenAddress: mintAddr, mint: mintAddr, sourceProgram: p, sourceSignature: sig, sampleLogs: (tx.meta&&tx.meta.logMessages||[]).slice(0,10), sourceCandidates: true };
+                try{ tok.createdHere = Boolean(isMintCreatedInThisTx(tx, mintAddr)); }catch(e){ tok.createdHere = false; }
                 try{
                   // Compute a deterministic age for the token using cached first-signature probe
                   try{
@@ -609,47 +654,21 @@ async function startSequentialListener(options){
                 }catch(e){}
                 return tok;
               }));
-        for(const uid of Object.keys(usersLocal || {})){
+              // filter out any nulls returned by validation
+              const _candidateTokens = (candidateTokens || []).filter(Boolean);
+  for(const uid of Object.keys(usersLocal || {})){
                 try{
           const user = usersLocal[uid];
                   if(!user || !user.strategy || user.strategy.enabled === false) continue;
           // run the filter (allow enrichment inside strategy filter for accuracy)
       if(!strategyFilterLocal) continue;
-          // If the user's numeric strategy fields are all zero/undefined, treat this user
-          // as a listener-only user: accept listener-provided candidateTokens directly
-          // (no conditions, no enrichment). Otherwise run the normal strategy filter.
-          let matched = [];
-          try{
-            // Consider market-related numeric constraints when deciding listener bypass.
-            // Age-related fields are handled separately and should not prevent listener-only fast-path.
-            const numericKeys = ['minMarketCap','minLiquidity','minVolume'];
-            const hasNumericConstraint = numericKeys.some(k => {
-              const v = user.strategy && user.strategy[k];
-              return v !== undefined && v !== null && Number(v) > 0;
-            });
-            if(!hasNumericConstraint){
-              // listener-only: accept raw listener tokens as matches (limit to maxTrades)
-              const maxTrades = Number(user.strategy && user.strategy.maxTrades ? user.strategy.maxTrades : 3) || 3;
-              matched = (Array.isArray(candidateTokens) ? candidateTokens.slice(0, maxTrades) : []);
-              try{ console.error(`MATCH (listener-bypass) user=${uid} matched=${matched.map(t=>t.address||t.tokenAddress||t.mint).slice(0,5)}`); }catch(e){}
-            } else {
-              // default: run the robust strategy filter (may enrich)
-              // DEBUG: print per-candidate diagnostics so we can see why tokens are rejected
-              try{
-                const tu = require('../src/utils/tokenUtils');
-                for(const tok of candidateTokens){
-                  try{
-                    const pre = tu.autoFilterTokensVerbose([tok], user.strategy);
-                    const preCount = Array.isArray(pre) ? (pre.length) : (pre && pre.passed ? (pre.passed.length||0) : 0);
-                    const willPass = await strategyFilterLocal([tok], user.strategy, { preserveSources: true }).then(r=> Array.isArray(r) && r.length>0).catch(()=>false);
-                    try{ console.error(`STRATEGY_DEBUG user=${uid} token=${tok && (tok.tokenAddress||tok.address||tok.mint)} preCandidates=${preCount} pass=${willPass} age=${tok && (tok._canonicalAgeSeconds || (tok.freshnessDetails && tok.freshnessDetails.firstTxMs)) || 'n/a'} sampleLogs=${(tok && tok.sampleLogs? (tok.sampleLogs||[]).slice(0,3).join('|') : '')}`); }catch(e){}
-                  }catch(e){}
-                }
-              }catch(e){}
-              matched = await strategyFilterLocal(candidateTokens, user.strategy, { preserveSources: true }).catch(() => []);
-            }
-          }catch(e){ matched = []; }
-                  if(Array.isArray(matched) && matched.length > 0){
+          // Per user: do NOT apply market numeric filters (liquidity/marketCap/volume).
+          // The user requested that only the age threshold be used from the strategy.
+          // Therefore accept the listener-provided candidateTokens and apply per-user
+          // age cutoff, explicit-created filter, and per-user maxTrades later.
+          let matched = Array.isArray(candidateTokens) ? candidateTokens.slice(0) : [];
+          try{ if(!ONLY_PRINT_EXPLICIT) console.error(`MATCH (listener) user=${uid} matched_candidates=${matched.map(t=>t.address||t.tokenAddress||t.mint).slice(0,10)}`); }catch(e){}
+                    if(Array.isArray(matched) && matched.length > 0){
                     // Per-user age cutoff: interpret user.strategy.minAge as max allowed age (seconds)
                     const userMinAgeRaw = user && user.strategy ? user.strategy.minAge : undefined;
                     const userMinAge = (userMinAgeRaw !== undefined && userMinAgeRaw !== null && !isNaN(Number(userMinAgeRaw))) ? Number(userMinAgeRaw) : null;
@@ -674,15 +693,22 @@ async function startSequentialListener(options){
                       matchedFiltered = matched.slice(0);
                     }
 
+                    // Enforce explicit-created only for per-user notifications: require createdHere
+                    try{ matchedFiltered = (matchedFiltered || []).filter(t => t && t.createdHere === true); }catch(e){}
                     if(!Array.isArray(matchedFiltered) || matchedFiltered.length === 0) {
                       // nothing left after per-user filtering
                       continue;
                     }
 
-                    // Merge matched tokens into a single compact payload (up to 10 tokens)
-                    const matchAddrs = matchedFiltered.map(t => t.address || t.tokenAddress || t.mint).slice(0,10);
-                    const userEvent = { time:new Date().toISOString(), program:p, signature:sig, user: uid, matched: matchAddrs, kind: kind, candidateTokens: matchedFiltered.slice(0,10) };
-                    console.error('MATCH', JSON.stringify(userEvent));
+                    // Apply user's maxTrades to the explicit-only list (default 3)
+                    const userMaxTrades = Number(user && user.strategy && user.strategy.maxTrades ? user.strategy.maxTrades : 3) || 3;
+                    const matchedFinal = (Array.isArray(matchedFiltered) ? matchedFiltered.slice(0, userMaxTrades) : []);
+
+                    // Merge matched tokens into a single compact payload limited by userMaxTrades
+                    // Prefer canonical on-chain mint/tokenAddress for exported addresses (mint first)
+                    const matchAddrs = matchedFinal.map(t => (t && (t.mint || t.tokenAddress || t.address)) || null).filter(Boolean).slice(0, userMaxTrades);
+                    const userEvent = { time:new Date().toISOString(), program:p, signature:sig, user: uid, matched: matchAddrs, kind: kind, candidateTokens: matchedFinal.slice(0,userMaxTrades), tokens: matchedFinal.slice(0,userMaxTrades) };
+                    if(!ONLY_PRINT_EXPLICIT) console.error('MATCH', JSON.stringify(userEvent));
                     // Build a Telegram-ready payload using tokenUtils if available
                     let payload = { time: userEvent.time, program: p, signature: sig, matched: matchAddrs, tokens: userEvent.candidateTokens };
                     try{
@@ -701,8 +727,9 @@ async function startSequentialListener(options){
                         const firstAddr = (userEvent.candidateTokens && userEvent.candidateTokens[0]) || null;
                         if(firstAddr){
                           const tokenObj = firstAddr; // already a lightweight token object
-                          const botUsername = process.env.BOT_USERNAME || 'YourBotUsername';
-                          const pairAddress = tokenObj.pairAddress || tokenObj.tokenAddress || tokenObj.address || tokenObj.mint || '';
+                            const botUsername = process.env.BOT_USERNAME || 'YourBotUsername';
+                            // Use canonical id for pairAddress argument: prefer mint/tokenAddress/address and avoid pairAddress when possible
+                            const pairAddress = tokenObj.mint || tokenObj.tokenAddress || tokenObj.address || tokenObj.pairAddress || '';
                           try{
                             const built = _tokenUtils.buildTokenMessage(tokenObj, botUsername, pairAddress, uid);
                             if(built && built.msg){ payload.html = built.msg; payload.inlineKeyboard = built.inlineKeyboard || built.inlineKeyboard; }
@@ -761,12 +788,12 @@ async function startSequentialListener(options){
                                   // run in background, do not block main listener loop
                                   const execTokens = Array.isArray(matched) ? matched.slice(0, Number(user.strategy && user.strategy.maxTrades ? user.strategy.maxTrades : 3) || 1) : [];
                                   (async () => {
-                                    try{ await autoExec(user, execTokens, 'buy'); }catch(e){ try{ console.error('[listener:autoExec] error', (e && e.message) || e); }catch(_){} }
+                                    try{ await autoExec(user, execTokens, 'buy'); }catch(e){ try{ if(!ONLY_PRINT_EXPLICIT) console.error('[listener:autoExec] error', (e && e.message) || e); }catch(_){} }
                                   })();
                                 }
                               }catch(e){ /* ignore auto-exec errors */ }
                             } else if(shouldAuto && hasCredentials && !userConfirmed){
-                              try{ console.error(`[listener:autoExec] user=${uid} not in AUTO_EXEC_CONFIRM_USER_IDS - skipping auto-exec`); }catch(e){}
+                              try{ if(!ONLY_PRINT_EXPLICIT) console.error(`[listener:autoExec] user=${uid} not in AUTO_EXEC_CONFIRM_USER_IDS - skipping auto-exec`); }catch(e){}
                             }
                           }catch(e){}
                         }
@@ -779,25 +806,30 @@ async function startSequentialListener(options){
           }catch(e){ }
           await sleep(120);
         }
-        console.error(`[${p}] done`);
-      }catch(e){ console.error(`[${p}] err ${String(e)}`); }
+  if(!ONLY_PRINT_EXPLICIT) console.error(`[${p}] done`);
+  }catch(e){ if(!ONLY_PRINT_EXPLICIT) console.error(`[${p}] err ${String(e)}`); }
     }
     // Print RPC stats summary per full cycle
     try{
       const avg = RPC_STATS.calls ? Math.round(RPC_STATS.totalLatencyMs / RPC_STATS.calls) : 0;
-      console.error('RPC_STATS', JSON.stringify({ calls: RPC_STATS.calls, errors: RPC_STATS.errors, rateLimit429: RPC_STATS.rateLimit429, avgLatencyMs: avg }));
+  if(!ONLY_PRINT_EXPLICIT) console.error('RPC_STATS', JSON.stringify({ calls: RPC_STATS.calls, errors: RPC_STATS.errors, rateLimit429: RPC_STATS.rateLimit429, avgLatencyMs: avg }));
     }catch(e){}
     // short delay between cycles to avoid tight looping
     try { await sleep(2000); } catch (e) { }
   }
-  console.error('Sequential 10s per-program listener stopped');
+  if(!ONLY_PRINT_EXPLICIT) console.error('Sequential 10s per-program listener stopped');
 }
 
 module.exports.startSequentialListener = startSequentialListener;
 // Lightweight one-shot collector: run the minimal discovery loop until we collect
 // `maxCollect` fresh mints or `timeoutMs` elapses. Returns an array of mint addresses.
 // Collector: try to give enough time to iterate all configured programs by default
-async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || Math.max(20000, PER_PROGRAM_DURATION_MS * (PROGRAMS.length || 1) + 5000)), maxAgeSec = undefined, strictOverride = false, ageOnly = false } = {}){
+async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || Math.max(20000, PER_PROGRAM_DURATION_MS * (PROGRAMS.length || 1) + 5000)), maxAgeSec = undefined, strictOverride = false, ageOnly = false, onlyPrintExplicit = undefined } = {}){
+  // allow caller to request explicit-only mode for this collector run
+  try{ if(typeof onlyPrintExplicit !== 'undefined') ONLY_PRINT_EXPLICIT = Boolean(onlyPrintExplicit); }catch(e){}
+  // If explicit-only mode requested, force minimal output immediately to avoid
+  // printing collector debug lines during discovery.
+  try{ if(ONLY_PRINT_EXPLICIT) MINIMAL_OUTPUT = true; }catch(e){}
   const collected = [];
   const seenMintsLocal = new Set();
   const stopAt = Date.now() + (Number(timeoutMs) || 20000);
@@ -806,7 +838,7 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
       if(Date.now() > stopAt) break;
       try{
     const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: SIG_BATCH_LIMIT }]);
-    try{ console.error(`[LISTENER_DEBUG prog=${p}] signatures=${Array.isArray(sigs)?sigs.length:0}`); }catch(e){}
+  try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG prog=${p}] signatures=${Array.isArray(sigs)?sigs.length:0}`); }catch(e){}
     if(!Array.isArray(sigs) || sigs.length===0) continue;
         for(const s of sigs){
           if(Date.now() > stopAt) break;
@@ -821,8 +853,18 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
             for(const m of mints){
             if(collected.length >= maxCollect) break;
             if(seenMintsLocal.has(m)) continue;
+            // Determine whether this mint was explicitly created/initialized in this tx
+            let createdHere = false;
+            try{
+              // Strict detection: rely only on isMintCreatedInThisTx (which requires parsed reference AND log marker)
+              createdHere = isMintCreatedInThisTx(tx, m);
+            }catch(e){ createdHere = false; }
+            // When explicit-only mode is requested, skip any mint that was not created in this tx
+            if(ONLY_PRINT_EXPLICIT && !createdHere) { continue; }
             // Use centralized freshness policy for collector: require isMintFresh true
-            const accept = await isMintFresh(m, tx, txBlock, sig, kind, maxAgeSec, ageOnly).catch(()=>false);
+            let accept = await isMintFresh(m, tx, txBlock, sig, kind, maxAgeSec, ageOnly).catch(()=>false);
+            // If this mint was explicitly created in this tx, accept regardless of other freshness heuristics
+            if(createdHere) accept = true;
             if(!accept){
               try{
                 const firstCached = await getFirstSignatureCached(m).catch(()=>null);
@@ -853,31 +895,45 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
                     }
                   }
                 }
-                console.error(`COLLECT_DEBUG reject program=${p} kind=${kind} mint=${m} age=${ageSec} threshold=${threshold} reason=${reason} sig=${sig}`);
-              }catch(e){ console.error(`COLLECT_DEBUG reject program=${p} mint=${m} reason=debug-failed`); }
+                if(!MINIMAL_OUTPUT) console.error(`COLLECT_DEBUG reject program=${p} kind=${kind} mint=${m} age=${ageSec} threshold=${threshold} reason=${reason} sig=${sig}`);
+              }catch(e){ if(!MINIMAL_OUTPUT) console.error(`COLLECT_DEBUG reject program=${p} mint=${m} reason=debug-failed`); }
             }
+            // If explicit-only mode is active, require mint creation markers in this tx.
+            // Skip non-explicit tokens when explicit-only mode is requested.
+            if(ONLY_PRINT_EXPLICIT && !createdHere) { continue; }
             if(accept){
               try{
                 // compute lightweight on-chain age fields for downstream consumers
                 const firstCached = await getFirstSignatureCached(m).catch(()=>null);
                 const ft = firstCached && firstCached.blockTime ? firstCached.blockTime : null;
                 const ageSec = getCanonicalAgeSeconds(ft, txBlock);
-                console.error(`COLLECT_DEBUG accept program=${p} kind=${kind} mint=${m} age=${ageSec} firstBlock=${ft} txBlock=${txBlock} sig=${sig}`);
-                const tok = {
-                  tokenAddress: m,
-                  address: m,
-                  mint: m,
-                  firstBlockTime: ft ? Number(ft) * 1000 : null, // ms epoch when available
-                  _canonicalAgeSeconds: ageSec,
-                  sourceProgram: p,
-                  sourceSignature: sig,
-                  kind: kind,
-                  txBlock: txBlock,
-                  sampleLogs: (tx.meta && tx.meta.logMessages || []).slice(0,6),
-                  __listenerCollected: true,
-                };
-                collected.push(tok);
-                seenMintsLocal.add(m);
+                if(!MINIMAL_OUTPUT) console.error(`COLLECT_DEBUG accept program=${p} kind=${kind} mint=${m} age=${ageSec} firstBlock=${ft} txBlock=${txBlock} sig=${sig}`);
+                // Validate mint is a parseable PublicKey and not a known program id
+                try{
+                  const { PublicKey } = require('@solana/web3.js');
+                  const pk = new PublicKey(m);
+                  const normalized = pk.toBase58();
+                  if(!normalized || DENY.has(normalized) || PROGRAMS.includes(normalized)){
+                    // reject
+                  } else {
+                    const tok = {
+                      tokenAddress: m,
+                      address: m,
+                      mint: m,
+                      firstBlockTime: ft ? Number(ft) * 1000 : null, // ms epoch when available
+                      _canonicalAgeSeconds: ageSec,
+                      sourceProgram: p,
+                      sourceSignature: sig,
+                      kind: kind,
+                      txBlock: txBlock,
+                      sampleLogs: (tx.meta && tx.meta.logMessages || []).slice(0,6),
+                      createdHere: Boolean(isMintCreatedInThisTx(tx, m)),
+                      __listenerCollected: true,
+                    };
+                    collected.push(tok);
+                    seenMintsLocal.add(m);
+                  }
+                }catch(e){ /* invalid mint, skip */ }
               }catch(e){
                 // fallback: still push a simple string if object creation fails
                 try{ collected.push(m); seenMintsLocal.add(m); }catch(_){}
@@ -895,32 +951,26 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
 module.exports.collectFreshMints = collectFreshMints;
 // Helper: collect once and return per-user merged payloads filtered by each user's strategy
 async function collectFreshMintsPerUser(usersObj = {}, { maxCollect = 10, timeoutMs = (Number(process.env.COLLECT_TIMEOUT_MS) || 20000), strictOverride = false, ageOnly = false } = {}){
-  // Determine the maximal per-user age threshold (seconds) to pass into the collector
-  // so the centralized freshness checks honor user-configured age windows.
-  let maxUserAge = undefined;
-  try{
-    for(const uid of Object.keys(usersObj || {})){
-      try{
-        const user = usersObj[uid] || {};
-        let rawAge = (user && user.strategy && (user.strategy.maxAgeSec !== undefined)) ? user.strategy.maxAgeSec : (user && user.strategy ? user.strategy.minAge : undefined);
-        if(rawAge === undefined || rawAge === null){
-          // try parse legacy durations if tokenUtils available
-          if(_tokenUtils && typeof _tokenUtils.parseDuration === 'function' && rawAge !== undefined && rawAge !== null){
-            rawAge = _tokenUtils.parseDuration(rawAge);
-          }
-        }
-        const num = (rawAge !== undefined && rawAge !== null && !Number.isNaN(Number(rawAge))) ? Number(rawAge) : undefined;
-        if(typeof num === 'number' && !isNaN(num)){
-          if(maxUserAge === undefined || num > maxUserAge) maxUserAge = num;
-        }
-      }catch(e){}
-    }
-  }catch(e){}
+  // Do not pass per-user age thresholds into the centralized collector. We want
+  // the collector to discover explicit-created mints first; apply per-user
+  // age filters after discovery so users don't influence which mints are found.
+  try{ if(ONLY_PRINT_EXPLICIT) MINIMAL_OUTPUT = true; }catch(e){}
 
-  try{ console.error(`[LISTENER_DEBUG] collectFreshMintsPerUser using maxUserAge=${String(maxUserAge)} for users=${Object.keys(usersObj||{}).length}`); }catch(e){}
-  // Run a single collector pass with maxAgeSec set to the largest per-user threshold found
-  const collected = await collectFreshMints({ maxCollect, timeoutMs, maxAgeSec: maxUserAge, strictOverride, ageOnly });
-  try{ console.error(`[LISTENER_DEBUG] collected candidates=${Array.isArray(collected)?collected.length:0} for users=${Object.keys(usersObj||{}).length}`); }catch(e){}
+  try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG] collectFreshMintsPerUser starting collector for users=${Object.keys(usersObj||{}).length}`); }catch(e){}
+  // Run a single collector pass without per-user age prefiltering so discovery is unbiased
+  const collected = await collectFreshMints({ maxCollect, timeoutMs, strictOverride, ageOnly, onlyPrintExplicit: true });
+  // When explicit-only mode is active, discard any collected items that don't have
+  // a definitive createdHere flag so downstream per-user payloads are authoritative.
+  const pool = Array.isArray(collected) ? collected : [];
+  const poolFiltered = pool.filter(c => {
+    try{
+      if(!c) return false;
+      if(typeof c === 'string') return false; // reject simple-string fallbacks
+      if(ONLY_PRINT_EXPLICIT) return Boolean(c.createdHere);
+      return true;
+    }catch(e){ return false; }
+  });
+  try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG] collected candidates=${poolFiltered.length} (after strict filter) for users=${Object.keys(usersObj||{}).length}`); }catch(e){}
   const result = {};
   for(const uid of Object.keys(usersObj || {})){
     try{
@@ -937,8 +987,8 @@ async function collectFreshMintsPerUser(usersObj = {}, { maxCollect = 10, timeou
           if(parsed !== undefined && parsed !== null && !Number.isNaN(Number(parsed))) userAgeThreshold = Number(parsed);
         }
       }catch(e){}
-      try{ console.error(`[LISTENER_DEBUG] user=${uid} rawAge=${String(rawAge)} userAgeThreshold=${String(userAgeThreshold)}`); }catch(e){}
-      const tokens = (Array.isArray(collected) ? collected : []).filter(t => {
+  try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG] user=${uid} rawAge=${String(rawAge)} userAgeThreshold=${String(userAgeThreshold)}`); }catch(e){}
+  const tokens = (Array.isArray(poolFiltered) ? poolFiltered : []).filter(t => {
         try{
           const age = (t && t._canonicalAgeSeconds != null) ? Number(t._canonicalAgeSeconds) : null;
           if(userAgeThreshold !== null){
@@ -947,27 +997,30 @@ async function collectFreshMintsPerUser(usersObj = {}, { maxCollect = 10, timeou
           return true;
         }catch(e){ return false; }
       }).slice(0, 10);
-      try{ console.error(`[LISTENER_DEBUG] user=${uid} matched_after_age_filter=${tokens.length}`); }catch(e){}
+  try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG] user=${uid} matched_after_age_filter=${tokens.length}`); }catch(e){}
       result[uid] = { user: String(uid), matched: tokens.map(t => t.mint), tokens };
       // If there are accepted tokens for this user, print them immediately using the bulleted message template
-      try{
-        if(Array.isArray(tokens) && tokens.length > 0){
-          if(_tokenUtils && typeof _tokenUtils.buildBulletedMessage === 'function'){
-            try{
-              const cluster = process.env.SOLANA_CLUSTER || 'mainnet';
-              const title = `Live tokens (listener) for ${uid}`;
-              const { text, inline_keyboard } = _tokenUtils.buildBulletedMessage(tokens, { cluster, title, maxShow: tokens.length });
-              // Print formatted HTML message to stderr (so logs and collectors can capture it)
-              console.error(`[LISTENER_MSG user=${uid}]`);
-              console.error(text);
-              try{ console.error('[LISTENER_MSG inline_keyboard]', JSON.stringify(inline_keyboard)); }catch(e){}
-            }catch(e){ console.error(`[LISTENER_MSG user=${uid}] buildBulletedMessage failed: ${String(e)}`); }
-          } else {
-            // fallback: simple list output
-            try{ console.error(`[LISTENER_MSG user=${uid}] accepted tokens: ${tokens.map(t => (t && (t.mint || t.tokenAddress || t.address)) || String(t)).join(', ')}`); }catch(e){}
+      try {
+        if (Array.isArray(tokens) && tokens.length > 0) {
+          // Only print rich LISTENER_MSG blocks when not in minimal mode and not in ONLY_PRINT_EXPLICIT mode
+          if (!MINIMAL_OUTPUT && !ONLY_PRINT_EXPLICIT) {
+            if (_tokenUtils && typeof _tokenUtils.buildBulletedMessage === 'function') {
+              try {
+                const cluster = process.env.SOLANA_CLUSTER || 'mainnet';
+                const title = `Live tokens (listener) for ${uid}`;
+                const { text, inline_keyboard } = _tokenUtils.buildBulletedMessage(tokens, { cluster, title, maxShow: tokens.length });
+                // Print formatted HTML message to stderr (so logs and collectors can capture it)
+                console.error(`[LISTENER_MSG user=${uid}]`);
+                console.error(text);
+                try { console.error('[LISTENER_MSG inline_keyboard]', JSON.stringify(inline_keyboard)); } catch (e) {}
+              } catch (e) { console.error(`[LISTENER_MSG user=${uid}] buildBulletedMessage failed: ${String(e)}`); }
+            } else {
+              // fallback: simple list output
+              try { console.error(`[LISTENER_MSG user=${uid}] accepted tokens: ${tokens.map(t => (t && (t.mint || t.tokenAddress || t.address)) || String(t)).join(', ')}`); } catch (e) {}
+            }
           }
         }
-      }catch(e){}
+      } catch (e) {}
     }catch(e){ result[uid] = { user: String(uid), matched: [], tokens: [] }; }
   }
   return result;
@@ -984,4 +1037,5 @@ try{
   module.exports.isMintFresh = isMintFresh;
   module.exports.getFirstSignatureCached = getFirstSignatureCached;
   module.exports.mintPreviouslySeen = mintPreviouslySeen;
+  module.exports.isMintCreatedInThisTx = isMintCreatedInThisTx;
 }catch(e){}

@@ -240,16 +240,29 @@ export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: 
             });
             if (!filtered.length) continue;
 
+            // If ONLY_PRINT_EXPLICIT is enabled, do not send quick DexScreener notifications
+            // from the fast token fetcher. The collector/listener is the authoritative
+            // source for explicit-created tokens and per-user messaging.
+            const onlyExplicit = (process.env.ONLY_PRINT_EXPLICIT === 'true' || process.env.ONLY_PRINT_EXPLICIT === '1');
+            if (onlyExplicit) {
+              // skip sending from fastTokenFetcher in explicit-only mode
+              continue;
+            }
+
             // Send notifications in a batch (one message with multiple tokens or multiple messages)
-            for (const token of filtered) {
-              const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || '';
-              const h = hashTokenAddress(addr);
-              try {
-                const msg = `🚀 Token matched: ${token.description || token.name || addr}\nAddress: ${addr}`;
-                await telegram.sendMessage(uid, msg);
-                await appendSentHash(uid, h);
-              } catch (e) {
-                // ignore send errors per token
+            // If ONLY_PRINT_EXPLICIT is enabled, skip sending quick notifications from this fast fetcher
+            // Only send quick notifications when not in explicit-only mode
+            if (!onlyExplicit) {
+              for (const token of filtered) {
+                const addr = token.mint || token.tokenAddress || token.address || token.pairAddress || '';
+                const h = hashTokenAddress(addr);
+                try {
+                  const msg = `🚀 Token matched: ${token.description || token.name || addr}\nAddress: ${addr}`;
+                  await telegram.sendMessage(uid, msg);
+                  await appendSentHash(uid, h);
+                } catch (e) {
+                  // ignore send errors per token
+                }
               }
             }
 

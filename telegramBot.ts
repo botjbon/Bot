@@ -81,9 +81,10 @@ async function ensureListenerStarted() {
     if (seq && typeof seq.startSequentialListener === 'function') {
       (async () => {
         try {
-          await seq.startSequentialListener();
+          // Request explicit-only terminal behavior when started from the running bot
+          await seq.startSequentialListener({ onlyPrintExplicit: true });
         } catch (e) {
-          try { console.error('[listener] failed to start (lazy):', e && (e.message || e)); } catch(_){}
+          try { console.error('[listener] failed to start (lazy):', e && (e.message || e)); } catch(_){ }
         }
       })();
       listenerStarted = true;
@@ -131,9 +132,28 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
     const seq = require('./scripts/sequential_10s_per_program.js');
     if (!seq || typeof seq.collectFreshMints !== 'function') return [];
   const strictOverride = (strategy && (strategy as any).collectorStrict !== undefined) ? Boolean((strategy as any).collectorStrict) : undefined;
-  const items = await seq.collectFreshMints({ maxCollect, maxAgeSec, strictOverride }).catch(() => []);
+  // Do not pass per-user age into the centralized collector. Discover explicit mints first,
+  // then apply per-user age filtering below. Force collector to run in explicit-only mode
+  // so we don't receive non-explicit tokens.
+  const items = await seq.collectFreshMints({ maxCollect, strictOverride, onlyPrintExplicit: true }).catch(() => []);
     if (!Array.isArray(items) || items.length === 0) return [];
-    const tokens = (items || []).map((it: any) => {
+    // Filter collector results: only include explicit-created mints when available
+    const isCreatedHelper = seq && typeof seq.isMintCreatedInThisTx === 'function' ? seq.isMintCreatedInThisTx : null;
+    const explicitOnlyFiltered = (items || []).filter((it: any) => {
+      try{
+        if(!it) return false;
+        // Reject simple-string fallbacks: require explicit creation evidence
+  if(typeof it === 'string') return false;
+  // Only accept items that the collector explicitly marked as createdHere.
+  // Do NOT attempt a log-only or heuristic fallback here when explicit-only mode
+  // is requested; this enforces the user's requirement that only explicit-created
+  // mints appear in the terminal and to users.
+  return Boolean(it.createdHere === true);
+      }catch(e){ return false; }
+    });
+  // Respect user's maxTrades (maxCollect) — slice to desired count
+  const desiredCount = Math.max(1, Number(strategy?.maxTrades || 3));
+  const tokens = (explicitOnlyFiltered || []).slice(0, desiredCount).map((it: any) => {
       if (!it) return null;
       if (typeof it === 'string') return { tokenAddress: it, address: it, mint: it, sourceCandidates: true, __listenerCollected: true };
       const addr = it.tokenAddress || it.address || it.mint || null;
@@ -297,14 +317,20 @@ bot.hears('📊 Show Tokens', async (ctx) => {
     // Run a single collection pass and get the merged payload for this user only
     const usersObj: Record<string, any> = {};
     usersObj[userId] = user;
-  const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect, timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride, ageOnly: ageOnlyMode }).catch(() => ({}));
+  const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect, timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride, ageOnly: ageOnlyMode, onlyPrintExplicit: true }).catch(() => ({}));
     const payload = collected && collected[userId] ? collected[userId] : null;
     if (!payload || !Array.isArray(payload.tokens) || payload.tokens.length === 0) {
       await ctx.reply('No live tokens found right now. Try again in a few seconds.');
       return;
     }
+  // Only show tokens that the collector marked as createdHere (explicit-created)
+  const explicitTokens = (payload.tokens || []).filter((t:any) => t && t.createdHere === true);
+  if (!explicitTokens || explicitTokens.length === 0) {
+    await ctx.reply('No explicit-created live tokens found right now. Try again in a few seconds.');
+    return;
+  }
   // Render the merged tokens payload (up to user's maxTrades) using the bulleted template
-  const tokens = payload.tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
+  const tokens = explicitTokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
   const { text, inline_keyboard } = buildBulletedMessage(tokens, { cluster: process.env.SOLANA_CLUSTER, title: 'Live tokens (listener)', maxShow: tokens.length });
   // Log the bulleted message and keyboard for offline review/debugging before replying
   try {
@@ -641,6 +667,13 @@ console.log('--- About to launch bot ---');
     try {
       users = await loadUsers();
       console.log('--- Users loaded (async) ---');
+      // If running in listener-only mode or SKIP_BOT_LAUNCH, start the sequential listener immediately
+      try{
+        if (LISTENER_ONLY_MODE || process.env.SKIP_BOT_LAUNCH === 'true') {
+          console.log('[startup] listener-only mode detected; starting sequential listener now');
+          try { await ensureListenerStarted(); } catch(e){ console.error('[startup] ensureListenerStarted failed:', e && (e.message||e)); }
+        }
+      }catch(e){}
   // startEnrichQueue disabled: listener is the only allowed source
 
       // Disable background file/redis polling notification pump. Instead listen to
@@ -662,13 +695,19 @@ console.log('--- About to launch bot ---');
               if(!uid) return;
               const user = users[uid]; if(!user || !user.strategy || user.strategy.enabled === false) return;
               if(!sentNotifications[uid]) sentNotifications[uid] = new Map();
-              // derive addresses to check suppression from matched or tokens
-              const matchAddrs = Array.isArray(userEvent.matched) && userEvent.matched.length ? userEvent.matched : (Array.isArray(userEvent.tokens) ? (userEvent.tokens.map((t:any)=>t.tokenAddress||t.address||t.mint).filter(Boolean)) : []);
-              const maxTrades = Number(user.strategy?.maxTrades || 3);
+              // Use authoritative tokens provided by the collector (userEvent.tokens).
+              // These should be the canonical, filtered set; enforce defensive checks here.
+              const maxTrades = Number(user.strategy?.maxTrades || 3) || 3;
+              // Always prefer only explicit-created tokens from the collector for listener notifications.
+              let tokenObjs = Array.isArray(userEvent.tokens) ? userEvent.tokens.slice(0, maxTrades) : [];
+              try { tokenObjs = (tokenObjs || []).filter((t:any)=> t && t.createdHere === true); } catch(e){}
+              // Log the incoming notification payload for debugging
+              try { console.log(`[NOTIF_IN] user=${uid} program=${userEvent && userEvent.program} signature=${userEvent && userEvent.signature} tokens=${tokenObjs.length}`); } catch(e){}
+              const matchAddrs = tokenObjs.map((t:any) => t && (t.tokenAddress || t.address || t.mint)).filter(Boolean);
               const toSend = [] as string[];
-              for(const a of (matchAddrs || []).slice(0, maxTrades)){
+              for (const a of matchAddrs) {
                 const last = sentNotifications[uid].get(a) || 0;
-                if(suppressionMs>0 && (Date.now()-last) < suppressionMs) continue;
+                if (suppressionMs > 0 && (Date.now() - last) < suppressionMs) continue;
                 toSend.push(a);
               }
               if(toSend.length===0) return;
@@ -678,29 +717,32 @@ console.log('--- About to launch bot ---');
                 let html = userEvent && userEvent.html;
                 let inlineKeyboard = userEvent && userEvent.inlineKeyboard;
                 // If HTML missing, try to build a bulleted message from tokens using tokenUtils
-                if((!html || typeof html !== 'string' || html.length===0) && userEvent && Array.isArray(userEvent.tokens) && userEvent.tokens.length > 0){
+        if((!html || typeof html !== 'string' || html.length===0) && tokenObjs && tokenObjs.length > 0){
                   try{
                     const tu = require('./src/utils/tokenUtils');
                     if(tu && typeof tu.buildBulletedMessage === 'function'){
                       const cluster = process.env.SOLANA_CLUSTER || 'mainnet';
                       const title = `Live tokens (listener)`;
-                      const built = tu.buildBulletedMessage(userEvent.tokens, { cluster, title, maxShow: Math.min(10, userEvent.tokens.length) });
-                      if(built && built.text) html = built.text;
-                      if(built && built.inline_keyboard) inlineKeyboard = built.inline_keyboard;
+          const built = tu.buildBulletedMessage(tokenObjs, { cluster, title, maxShow: Math.min(10, tokenObjs.length) });
+          if(built && built.text) html = built.text;
+          if(built && built.inline_keyboard) inlineKeyboard = built.inline_keyboard;
                     }
                   }catch(e){}
                 }
                 if(html && typeof html === 'string' && html.length>0){
                   const options: any = ({ parse_mode: 'HTML', disable_web_page_preview: false } as any);
                   if(inlineKeyboard) options.reply_markup = { inline_keyboard: inlineKeyboard };
-                  await (bot.telegram as any).sendMessage(chatId, html, options).catch(()=>{});
+                  // Log outgoing built payload for review
+                  try { console.log(`[NOTIF_OUT] user=${uid} html_len=${html.length} inline_kb=${inlineKeyboard ? JSON.stringify(inlineKeyboard).slice(0,200) : 'none'}`); } catch(e){}
+                  await (bot.telegram as any).sendMessage(chatId, html, options).catch((err:any)=>{ console.error('[NOTIF_SEND_ERR]', err && (err.message||err)); });
                 } else {
                   // fallback: simple list message
                   let text = `🔔 <b>Matched tokens for your strategy</b>\nProgram: <code>${userEvent.program}</code>\nSignature: <code>${userEvent.signature}</code>\n\n`;
                   text += `Matched (${toSend.length}):\n`;
                   for(const a of toSend.slice(0,10)) text += `• <code>${a}</code>\n`;
                   text += `\nTime: ${new Date().toISOString()}`;
-                  await (bot.telegram as any).sendMessage(chatId, text, ({ parse_mode: 'HTML', disable_web_page_preview: true } as any)).catch(()=>{});
+                  try { console.log(`[NOTIF_OUT_FALLBACK] user=${uid} text_snippet=${text.slice(0,200).replace(/\n/g,' ')}`); } catch(e){}
+                  await (bot.telegram as any).sendMessage(chatId, text, ({ parse_mode: 'HTML', disable_web_page_preview: true } as any)).catch((err:any)=>{ console.error('[NOTIF_SEND_ERR]', err && (err.message||err)); });
                 }
                 for(const a of toSend) sentNotifications[uid].set(a, Date.now());
               }catch(e){ /* swallow */ }
@@ -879,9 +921,11 @@ bot.command('show_token', async (ctx) => {
           const usersObj: Record<string, any> = {};
           usersObj[userId] = user;
           // Use per-user collector so user's strategy fields (minAge/maxAge) are applied at collection time
-          const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride, ageOnly: true }).catch(()=>({}));
+          const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride, ageOnly: true, onlyPrintExplicit: true }).catch(()=>({}));
           const entry = collected && collected[userId] ? collected[userId] : null;
           tokens = (entry && Array.isArray(entry.tokens)) ? entry.tokens.map((it:any)=> Object.assign({ tokenAddress: it.mint || it.tokenAddress || it.address, address: it.mint || it.tokenAddress || it.address, mint: it.mint || it.tokenAddress || it.address, sourceCandidates: true, __listenerCollected: true }, it)) : [];
+          // Only retain explicit-created tokens
+          tokens = (tokens || []).filter((t:any) => t && t.createdHere === true).slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
         }
       }catch(e){ listenerAvailable = false; }
       if(listenerAvailable){
@@ -968,7 +1012,7 @@ bot.command('show_token', async (ctx) => {
             }
           }catch(e){}
           const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-          const addrs = await seq.collectFreshMints({ maxCollect, maxAgeSec, strictOverride }).catch(()=>[]);
+          const addrs = await seq.collectFreshMints({ maxCollect, maxAgeSec, strictOverride, onlyPrintExplicit: true }).catch(()=>[]);
           if(Array.isArray(addrs) && addrs.length > 0){ try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} } return; }
         }
       }catch(e){}
@@ -1005,10 +1049,12 @@ bot.command('show_token', async (ctx) => {
             }
           }catch(e){}
           const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-          const addrs = await seq.collectFreshMints({ maxCollect, maxAgeSec, strictOverride }).catch(()=>[]);
-          if(Array.isArray(addrs) && addrs.length > 0){
+          const addrs = await seq.collectFreshMints({ maxCollect, maxAgeSec, strictOverride, onlyPrintExplicit: true }).catch(()=>[]);
+          // Ensure raw addrs are explicit-created when collector returned token objects
+          const explicitAddrs = Array.isArray(addrs) ? addrs.filter(a => { try{ if(!a) return false; if(typeof a === 'string') return false; return Boolean(a.createdHere === true); }catch(e){return false;} }).map(a => (a.tokenAddress||a.address||a.mint||String(a))) : [];
+          if(Array.isArray(explicitAddrs) && explicitAddrs.length > 0){
             // Return raw payload so user sees actual live mints discovered
-            try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} }
+            try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(explicitAddrs.slice(0, Math.max(10, explicitAddrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + explicitAddrs.join(', ')); }catch(e){} }
             return;
           }
         }

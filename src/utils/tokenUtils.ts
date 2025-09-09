@@ -365,7 +365,7 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
         else if (v === 'false' || v === '0' || v === 0 || v === false) strictOverride = false;
       }
     } catch (e) {}
-    const items: any[] = await seq.collectFreshMints({ maxCollect, timeoutMs, maxAgeSec, strictOverride }).catch(() => []);
+  const items: any[] = await seq.collectFreshMints({ maxCollect, timeoutMs, maxAgeSec, strictOverride, onlyPrintExplicit: true }).catch(() => []);
     if (!Array.isArray(items) || items.length === 0) return [];
     return items.map((it: any) => {
       // listener may return either simple mint strings or enriched token objects
@@ -1076,7 +1076,11 @@ export function fmt(val: number | string | undefined | null, digits?: number, un
 // --- Helper functions for building the message ---
 
 function buildInlineKeyboard(token: any, botUsername: string, pairAddress: string, userId?: string) {
-  const dexUrl = token.url || (pairAddress ? `https://dexscreener.com/solana/${pairAddress}` : '');
+  // Only expose external links for tokens explicitly created in the discovered tx
+  const isExplicit = Boolean(token && token.createdHere === true);
+  // For explicit tokens prefer token.url only; avoid constructing dexscreener links from pairAddress
+  // because pairAddress may be a liquidity/pair id or a program address unrelated to the mint.
+  const dexUrl = isExplicit ? (token.url || '') : (token.url || (pairAddress ? `https://dexscreener.com/solana/${pairAddress}` : ''));
   const twitterEmoji = '🐦', dexEmoji = '🧪', shareEmoji = '📤';
   const inlineKeyboard: any[][] = [];
   // Row 1: Twitter, DexScreener (only if available)
@@ -1089,11 +1093,14 @@ function buildInlineKeyboard(token: any, botUsername: string, pairAddress: strin
   if (dexUrl) row1.push({ text: `${dexEmoji} DexScreener`, url: dexUrl });
   if (row1.length) inlineKeyboard.push(row1);
   // Row 2: Share button (external share link)
-  let shareId = userId || token._userId || (token.tokenAddress || token.address || token.mint || token.pairAddress || '');
-  // External share link (Telegram deep link with share parameter)
-  const shareUrl = `https://t.me/share/url?url=https://t.me/${botUsername}?start=${shareId}`;
-  const row2: any[] = [ { text: `${shareEmoji} Share`, url: shareUrl } ];
-  inlineKeyboard.push(row2);
+  // Only add a Share button when the token is explicit and has a valid id
+  if (isExplicit) {
+  // Use canonical token id for sharing: prefer mint/tokenAddress/address and *avoid* pairAddress when explicit
+  let shareId = userId || token._userId || (token.mint || token.tokenAddress || token.address || token.pairAddress || '');
+    const shareUrl = `https://t.me/share/url?url=https://t.me/${botUsername}?start=${shareId}`;
+    const row2: any[] = [ { text: `${shareEmoji} Share`, url: shareUrl } ];
+    inlineKeyboard.push(row2);
+  }
   return { inlineKeyboard };
 }
 
@@ -1102,8 +1109,11 @@ function getTokenCoreFields(token: any) {
   return {
     name: token.name || token.baseToken?.name || '',
     symbol: token.symbol || token.baseToken?.symbol || '',
-    address: token.tokenAddress || token.address || token.mint || token.pairAddress || token.url?.split('/').pop() || '',
-    dexUrl: token.url || (token.pairAddress ? `https://dexscreener.com/solana/${token.pairAddress}` : ''),
+  // Prefer on-chain mint/tokenAddress/address as the canonical address. Avoid pairAddress for explicit tokens.
+  address: token.mint || token.tokenAddress || token.address || token.url?.split('/').pop() || token.pairAddress || '',
+  // Prefer an explicit token.url when present. Only fallback to pairAddress-based dexscreener URL
+  // for non-explicit tokens or when token.url is not available.
+  dexUrl: token.url || (token.pairAddress ? `https://dexscreener.com/solana/${token.pairAddress}` : ''),
     logo: token.imageUrl || token.logoURI || token.logo || token.baseToken?.logoURI || ''
   };
 }
@@ -1206,7 +1216,9 @@ export function buildTokenMessage(token: any, botUsername: string, pairAddress: 
   let msg = '';
   const nice = (v: any) => (v === undefined || v === null || v === 'Not available') ? '—' : v;
   // Title
-  msg += `🪙 ${solEmoji} <b>${name ? name : 'Unknown'}</b>${symbol ? ' <code>' + symbol + '</code>' : ''}\n`;
+  const isExplicit = Boolean(token && token.createdHere === true);
+  msg += `🪙 ${solEmoji} <b>${name ? name : 'Unknown'}</b>${symbol ? ' <code>' + symbol + '</code>' : ''}`;
+  msg += isExplicit ? ` <b>🔒 Explicit</b>\n` : ` <i>Not explicit</i>\n`;
   msg += `${linkEmoji} <b>Address:</b> <code>${address ? address : 'N/A'}</code>\n\n`;
   // --- Stats (compact, human friendly) ---
   msg += `${capEmoji} <b>Market Cap:</b> ${nice(fmtField(marketCap, 'marketCap'))} USD\n`;
@@ -1253,7 +1265,11 @@ export function buildTokenMessage(token: any, botUsername: string, pairAddress: 
     msg += `🌐 <b>Network:</b> ${network}\n`;
   }
   // --- Only add community/footer line ---
-  msg += `\n${memecoinEmoji} <b>Solana Memecoin Community</b> | ${solEmoji} <b>Powered by DexScreener</b>\n`;
+  if (isExplicit) {
+    msg += `\n${memecoinEmoji} <b>Solana Memecoin Community</b> | ${solEmoji} <b>Powered by DexScreener</b>\n`;
+  } else {
+    msg += `\n${memecoinEmoji} <b>Solana Memecoin Community</b>\n`;
+  }
   // --- Inline keyboard (all links/buttons at the bottom) ---
   const { inlineKeyboard } = buildInlineKeyboard(token, botUsername, pairAddress, userId);
   // Also produce a Markdown variant for clients that prefer Markdown (returned for inspection)
@@ -1279,7 +1295,7 @@ export function buildTokenMessage(token: any, botUsername: string, pairAddress: 
 
 // Build a concise preview message used in fast previews and notifications
 export function buildPreviewMessage(token: any): { title: string; addr: string; price: string; url?: string; shortMsg: string } {
-  const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || 'N/A';
+  const addr = token.mint || token.tokenAddress || token.address || token.pairAddress || 'N/A';
   const name = token.name || token.symbol || addr;
   const priceNum = token.priceUsd || token.price || token.priceUsdFloat || token.priceFloat;
   const price = (typeof priceNum === 'number') ? priceNum.toLocaleString(undefined, { maximumFractionDigits: 8 }) : (priceNum ? String(priceNum) : 'N/A');
@@ -1307,8 +1323,11 @@ export function buildBulletedMessage(tokens: any[], opts?: { cluster?: string; t
   const program = opts?.program || (Array.isArray(tokens) && tokens.length && (tokens[0].program || tokens[0].sourceProgram)) || undefined;
   const signature = opts?.signature || (Array.isArray(tokens) && tokens.length && (tokens[0].signature || tokens[0].sourceSignature)) || undefined;
 
+  // By default only include tokens explicitly created in the discovered tx (createdHere === true)
+  const allowNonExplicit = (opts && (opts as any).allowNonExplicit) === true;
+  const filteredTokens = Array.isArray(tokens) ? tokens.filter(t => { try { if (!t) return false; if (allowNonExplicit) return true; return Boolean(t.createdHere === true); } catch (e) { return false; } }) : [];
   // Header
-  let text = `🔔 <b>${title}${opts && (opts as any).forUser ? ' for ' + (opts as any).forUser : ''}</b>\nFound ${Array.isArray(tokens) ? tokens.length : 0} candidate(s) (showing ${Math.min(Array.isArray(tokens) ? tokens.length : 0, maxShow)}):\n`;
+  let text = `🔔 <b>${title}${opts && (opts as any).forUser ? ' for ' + (opts as any).forUser : ''}</b>\nFound ${filteredTokens.length} candidate(s) (showing ${Math.min(filteredTokens.length, maxShow)}):\n`;
   if (program) text += `Program: <code>${program}</code>\n`;
   if (signature) text += `Signature: <code>${signature}</code>\n`;
 
@@ -1316,11 +1335,11 @@ export function buildBulletedMessage(tokens: any[], opts?: { cluster?: string; t
 
   const botUsername = process.env.BOT_USERNAME || 'YourBotUsername';
 
-  for (let i = 0; i < Math.min(Array.isArray(tokens) ? tokens.length : 0, maxShow); i++) {
-    const t = tokens[i];
+  for (let i = 0; i < Math.min(filteredTokens.length, maxShow); i++) {
+    const t = filteredTokens[i];
     try {
       // Use the rich single-token template for each token
-      const pairAddress = t.pairAddress || t.tokenAddress || t.address || t.mint || '';
+  const pairAddress = t.pairAddress || t.tokenAddress || t.address || t.mint || '';
       const built = buildTokenMessage(t, botUsername, pairAddress, undefined);
       if (built && typeof built.msg === 'string') {
         // Separate items with two newlines for readability
@@ -1332,14 +1351,14 @@ export function buildBulletedMessage(tokens: any[], opts?: { cluster?: string; t
         text += `\n• <b>${preview.title}</b> <code>${addr}</code>\n${preview.shortMsg}\n`;
       }
       // Merge inline keyboard rows if present
-      if (built && Array.isArray(built.inlineKeyboard)) {
+  if (built && Array.isArray(built.inlineKeyboard)) {
         for (const row of built.inlineKeyboard) {
           if (Array.isArray(row) && row.length) inline_keyboard.push(row);
         }
       } else if (pairAddress) {
         // fallback: add an explorer button row
         const explorerBase = (cluster === 'devnet') ? 'https://explorer.solana.com' : 'https://explorer.solana.com';
-        inline_keyboard.push([{ text: `🔎 ${t.name || pairAddress}`, url: `${explorerBase}/address/${pairAddress}?cluster=${cluster}` }]);
+  inline_keyboard.push([{ text: `🔎 ${t.name || pairAddress}`, url: `${explorerBase}/address/${pairAddress}?cluster=${cluster}` }]);
       }
     } catch (e) {
       const addr = t && (t.tokenAddress || t.address || t.mint) || 'unknown';
@@ -1361,6 +1380,14 @@ function progressBar(percent: number, size = 10, fill = '█', empty = '░') {
 
 // Notify users with matching tokens (always uses autoFilterTokens)
 export async function notifyUsers(bot: any, users: Record<string, any>, tokens: any[]) {
+  // If ONLY_PRINT_EXPLICIT is enabled, strictly filter incoming tokens to those
+  // explicitly created in the discovered tx (createdHere === true). This prevents
+  // external quick-sources (DexScreener, etc.) from being sent to users when the
+  // system is operating in explicit-only mode.
+  try {
+    const onlyExplicit = (process.env.ONLY_PRINT_EXPLICIT === 'true' || process.env.ONLY_PRINT_EXPLICIT === '1');
+    if (onlyExplicit) tokens = Array.isArray(tokens) ? tokens.filter(t => t && t.createdHere === true) : [];
+  } catch (e) {}
   for (const uid of Object.keys(users)) {
     const strategy: Record<string, any> = users[uid]?.strategy || {};
     const filteredVerbose = autoFilterTokensVerbose(tokens, strategy);
