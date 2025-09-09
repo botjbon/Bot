@@ -47,6 +47,10 @@ console.log('--- Bot starting: Imports loaded ---');
 
 dotenv.config();
 
+// Enforce explicit-only operation for all Telegram user flows. This prevents any
+// user-level toggle or runtime override from bypassing explicit-created-only policy.
+try{ process.env.ONLY_PRINT_EXPLICIT = 'true'; }catch(e){}
+
 // Configuration values (can be overridden via .env)
 const HELIUS_BATCH_SIZE = Number(process.env.HELIUS_BATCH_SIZE ?? 8);
 const HELIUS_BATCH_DELAY_MS = Number(process.env.HELIUS_BATCH_DELAY_MS ?? 250);
@@ -67,9 +71,100 @@ if (!TELEGRAM_TOKEN) {
 }
 const bot = new Telegraf(TELEGRAM_TOKEN);
 console.log('--- Telegraf instance created ---');
+// Defensive global wrapper: prevent any sendMessage from delivering non-explicit addresses
+try{
+  if(bot && bot.telegram && !(bot.telegram as any).__explicit_guard_wrapped){
+    const origSend = bot.telegram.sendMessage.bind(bot.telegram);
+    // Redis-backed snapshot cache (short lived)
+    let _redisSnapshotCache: { ts: number, allowed: Set<string> } | null = null;
+    async function _getAllowedFromRedis(): Promise<Set<string>>{
+      try{
+        const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_URI || null;
+        if(!REDIS_URL) return new Set();
+        const { createClient } = require('redis');
+        const rc = createClient({ url: REDIS_URL });
+        rc.on && rc.on('error', ()=>{});
+        await rc.connect().catch(()=>{});
+        const key = process.env.LATEST_COLLECTED_REDIS_KEY || 'listener:latest_collected_obj';
+        const raw = await rc.get(key).catch(()=>null);
+        try{ await rc.disconnect().catch(()=>{}); }catch(e){}
+        if(!raw) return new Set();
+        const arr = JSON.parse(raw);
+        const s = new Set<string>();
+        if(Array.isArray(arr)){
+          for(const o of arr){ try{ const a = (o && (o.mint || o.tokenAddress || o.address)); if(a) s.add(String(a)); }catch(e){} }
+        }
+        return s;
+      }catch(e){ return new Set(); }
+    }
+
+    bot.telegram.sendMessage = async function(chatId: any, text: any, opts?: any){
+      try{
+        // Only enforce when explicit-only mode is active
+        const onlyExplicit = String(process.env.ONLY_PRINT_EXPLICIT ?? 'true').toLowerCase() === 'true';
+        if(onlyExplicit){
+          // collect candidate addresses from the text payload
+          let txt = '';
+          try{ txt = (typeof text === 'string') ? text : (JSON.stringify(text) || ''); }catch(e){}
+          // also inspect inline keyboard urls in opts.reply_markup.inline_keyboard
+          try{ if(opts && opts.reply_markup && opts.reply_markup.inline_keyboard){ txt += ' ' + JSON.stringify(opts.reply_markup.inline_keyboard); } }catch(e){}
+          // regex for base58-like Solana pubkey (32-44 chars)
+          const re = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
+          const found = new Set<string>();
+          try{ let m; while((m = re.exec(String(txt))) !== null){ if(m && m[0]) found.add(m[0]); } }catch(e){}
+          // if no addresses found, allow send
+          if(found.size > 0){
+            // Build allowed set strictly from the collector snapshot first (in-process)
+            const allowed = new Set<string>();
+            try{
+              const seq = require('./scripts/sequential_10s_per_program.js');
+              if(seq && Array.isArray(seq.LATEST_COLLECTED_OBJ) && seq.LATEST_COLLECTED_OBJ.length > 0){
+                for(const o of seq.LATEST_COLLECTED_OBJ){ try{ const a = (o && (o.mint || o.tokenAddress || o.address)); if(a) allowed.add(String(a)); }catch(e){} }
+              }
+            }catch(e){}
+            // If collector snapshot is empty/unavailable try Redis (shared snapshot across processes)
+            if(allowed.size === 0){
+              try{
+                const cacheTtlMs = Number(process.env.LATEST_COLLECTED_REDIS_CACHE_MS || 1500);
+                if(!_redisSnapshotCache || (Date.now() - _redisSnapshotCache.ts) > cacheTtlMs){
+                  const redisAllowed = await _getAllowedFromRedis().catch(()=>new Set());
+                  // coerce type to Set<string>
+                  const redisAllowedStr = new Set<string>();
+                  try{ for(const v of Array.from(redisAllowed || [] as any)) if(v) redisAllowedStr.add(String(v)); }catch(e){}
+                  _redisSnapshotCache = { ts: Date.now(), allowed: redisAllowedStr };
+                }
+                if(_redisSnapshotCache && _redisSnapshotCache.allowed && _redisSnapshotCache.allowed.size>0){
+                  for(const a of _redisSnapshotCache.allowed) allowed.add(a);
+                }
+              }catch(e){}
+            }
+            // If collector+redis snapshot is empty/unavailable then deny any outgoing message containing addresses
+            if(allowed.size === 0){
+              try{ console.warn('[EXPLICIT_GUARD] Blocking sendMessage because collector snapshot empty and message contains addresses'); }catch(e){}
+              try{ if(opts && opts.fallbackText && typeof opts.fallbackText === 'string'){ return await origSend(chatId, opts.fallbackText, { parse_mode: 'HTML', disable_web_page_preview: true }); } }catch(e){}
+              return null;
+            }
+            // ensure every found address is allowed
+            const disallowed: string[] = [];
+            for(const aRaw of Array.from(found)){ const a = String(aRaw || ''); if(a && !allowed.has(a)) disallowed.push(a); }
+            if(disallowed.length > 0){
+              try{ console.warn('[EXPLICIT_GUARD] Blocking sendMessage to=' + String(chatId) + ' disallowed_addrs=' + JSON.stringify(disallowed)); }catch(e){}
+              try{ if(opts && opts.fallbackText && typeof opts.fallbackText === 'string'){ return await origSend(chatId, opts.fallbackText, { parse_mode: 'HTML', disable_web_page_preview: true }); } }catch(e){}
+              return null;
+            }
+          }
+        }
+      }catch(e){ /* allow send on wrapper failure to avoid total blockage */ }
+      return await origSend(chatId, text, opts);
+    };
+    (bot.telegram as any).__explicit_guard_wrapped = true;
+  }
+}catch(e){}
 let users: Record<string, any> = {};
 console.log('--- Users placeholder created ---');
 let boughtTokens: Record<string, Set<string>> = {};
+// Store the last tokens shown to each user so the 'Select token' dropdown can present explicit mints
+const LAST_SHOWN_TOKENS: Record<string, any[]> = {};
 const restoreStates: Record<string, boolean> = {};
 let listenerStarted = false;
 
@@ -135,7 +230,27 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
   // Do not pass per-user age into the centralized collector. Discover explicit mints first,
   // then apply per-user age filtering below. Force collector to run in explicit-only mode
   // so we don't receive non-explicit tokens.
-  const items = await seq.collectFreshMints({ maxCollect, strictOverride, onlyPrintExplicit: true }).catch(() => []);
+  let items = await seq.collectFreshMints({ maxCollect, strictOverride, onlyPrintExplicit: true }).catch(() => []);
+    // Immediately normalize and enforce explicit-only tokens coming from collector
+    try{
+      const { normalizeTokenForDisplay } = require('./src/utils/tokenUtils');
+      const { enforceExplicitTokens, isExplicitOnly } = require('./src/explicit');
+      if (Array.isArray(items) && items.length) {
+        items = items.map((t:any)=> normalizeTokenForDisplay(t));
+        try{ if (isExplicitOnly && isExplicitOnly()) items = enforceExplicitTokens(items); }catch(e){}
+      }
+    }catch(e){}
+    // If the listener exposes a recent detailed snapshot, prefer objects from that snapshot
+    // when they match the addresses the collector returned. This avoids losing createdHere/collectedAtMs
+    // metadata when the collector returns simplified string addresses.
+    try{
+      const snap = seq && seq.LATEST_COLLECTED_OBJ;
+      if(Array.isArray(snap) && snap.length && Array.isArray(items) && items.length){
+        const want = new Set(items.map(i => (typeof i === 'string' ? i : (i.mint || i.tokenAddress || i.address))));
+        const matched = snap.filter(o => o && want.has(o.mint || o.tokenAddress || o.address));
+        if(matched && matched.length) items = matched.slice(0, items.length);
+      }
+    }catch(e){}
     if (!Array.isArray(items) || items.length === 0) return [];
     // Filter collector results: only include explicit-created mints when available
     const isCreatedHelper = seq && typeof seq.isMintCreatedInThisTx === 'function' ? seq.isMintCreatedInThisTx : null;
@@ -175,14 +290,20 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
       if (!isNaN(Number(maxAgeSeconds)) && maxAgeSeconds !== undefined && maxAgeSeconds !== null && Number(maxAgeSeconds) > 0) {
         const accepted = tokens.filter((t: any) => {
           try{
-            // prefer _canonicalAgeSeconds (seconds)
+            // prefer collector capture-based age when available (ageSinceCaptureSec or collectedAtMs), then fallback to canonical/on-chain age
             let ageSec: number | undefined = undefined;
-            if (t && t._canonicalAgeSeconds !== undefined && t._canonicalAgeSeconds !== null) ageSec = Number(t._canonicalAgeSeconds);
-            else if (t && t.ageSeconds !== undefined && t.ageSeconds !== null) ageSec = Number(t.ageSeconds);
-            else if (t && t.firstBlockTime) {
-              const ftMs = Number(t.firstBlockTime);
-              if (!isNaN(ftMs) && ftMs > 0) ageSec = (Date.now() - ftMs) / 1000;
-            }
+            try {
+              if (t && t.ageSinceCaptureSec !== undefined && t.ageSinceCaptureSec !== null) ageSec = Number(t.ageSinceCaptureSec);
+              else if (t && (t.collectedAtMs !== undefined && t.collectedAtMs !== null)) {
+                const ms = Number(t.collectedAtMs);
+                if (!isNaN(ms) && ms > 0) ageSec = (Date.now() - ms) / 1000;
+              } else if (t && t._canonicalAgeSeconds !== undefined && t._canonicalAgeSeconds !== null) ageSec = Number(t._canonicalAgeSeconds);
+              else if (t && t.ageSeconds !== undefined && t.ageSeconds !== null) ageSec = Number(t.ageSeconds);
+              else if (t && t.firstBlockTime) {
+                const ftMs = Number(t.firstBlockTime);
+                if (!isNaN(ftMs) && ftMs > 0) ageSec = (Date.now() - ftMs) / 1000;
+              }
+            } catch (e) { ageSec = undefined; }
             if (ageSec === undefined || isNaN(ageSec)) return false; // strict: require known on-chain age
             // Accept tokens younger or equal to the max allowed age
             return ageSec <= Number(maxAgeSeconds);
@@ -318,6 +439,16 @@ bot.hears('📊 Show Tokens', async (ctx) => {
     const usersObj: Record<string, any> = {};
     usersObj[userId] = user;
   const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect, timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride, ageOnly: ageOnlyMode, onlyPrintExplicit: true }).catch(() => ({}));
+    // Normalize and enforce explicit tokens immediately after collection
+    try{
+      const { normalizeTokenForDisplay } = require('./src/utils/tokenUtils');
+      const { enforceExplicitTokens, isExplicitOnly } = require('./src/explicit');
+      if(collected && collected[userId] && Array.isArray(collected[userId].tokens)){
+        let toks = collected[userId].tokens.map((t:any)=> normalizeTokenForDisplay(t));
+        try{ if(isExplicitOnly && isExplicitOnly()) toks = enforceExplicitTokens(toks); }catch(e){}
+        collected[userId].tokens = toks;
+      }
+    }catch(e){}
     const payload = collected && collected[userId] ? collected[userId] : null;
     if (!payload || !Array.isArray(payload.tokens) || payload.tokens.length === 0) {
       await ctx.reply('No live tokens found right now. Try again in a few seconds.');
@@ -338,7 +469,17 @@ bot.hears('📊 Show Tokens', async (ctx) => {
     console.log(tag, text);
     try { console.log(tag + ' inline_keyboard:', JSON.stringify(inline_keyboard, null, 2)); } catch (e) { console.log(tag + ' inline_keyboard (stringify failed)'); }
   } catch (e) { /* ignore logging errors */ }
-  await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard } } as any));
+  // Debug: canonical payload printing suppressed to reduce log noise.
+  try{
+    // Intentionally left blank: detailed token payload debug removed per request.
+  }catch(e){}
+  // Store the last explicitly shown tokens for this user so the dropdown can reference them
+  try{ LAST_SHOWN_TOKENS[String(userId)] = (tokens || []).map((t:any)=> ({ address: t.address || t.mint || t.tokenAddress, mint: t.mint, tokenAddress: t.tokenAddress, createdHere: t.createdHere })); }catch(e){}
+
+  // Inject a dropdown button row at the top that opens a callback to list explicit tokens
+  const dropdownRow = [{ text: 'Select explicit token', callback_data: 'list_tokens' }];
+  const markup = { inline_keyboard: [ dropdownRow, ...Array.isArray(inline_keyboard) ? inline_keyboard : [] ] };
+  await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup } as any));
   } catch (e) {
     console.error('[show_tokens] error', e && (e.message || e));
     try { await ctx.reply('Error fetching live tokens.'); } catch(_){}
@@ -656,6 +797,35 @@ bot.on('text', async (ctx, next) => {
   if (typeof next === 'function') return next();
 });
 
+// Callback handler: list explicit tokens previously shown to this user and allow selection
+bot.on('callback_query', async (ctx: any) => {
+  try{
+    const data = ctx.callbackQuery && ctx.callbackQuery.data ? String(ctx.callbackQuery.data) : '';
+    const userId = String(ctx.from && ctx.from.id);
+    if (!data) { await ctx.answerCbQuery(); return; }
+    if (data === 'list_tokens'){
+      const toks = LAST_SHOWN_TOKENS[userId] || [];
+      if(!Array.isArray(toks) || toks.length===0){ await ctx.answerCbQuery('No explicit tokens available', { show_alert: true }); return; }
+      // Build rows of buttons with callback_data select_token:<addr>
+      const rows = toks.map((t:any)=> [{ text: t.address || t.mint || t.tokenAddress || 'unknown', callback_data: `select_token:${t.address || t.mint || t.tokenAddress}`}]);
+      try{ await ctx.editMessageReplyMarkup({ inline_keyboard: rows }); }catch(e){ /* ignore */ }
+      await ctx.answerCbQuery();
+      return;
+    }
+    if (data.startsWith('select_token:')){
+      const parts = data.split(':');
+      const sel = parts.slice(1).join(':');
+      const toks = LAST_SHOWN_TOKENS[userId] || [];
+      const found = (toks || []).find((t:any)=> (t.address === sel) || (t.mint === sel) || (t.tokenAddress === sel));
+      if(!found){ await ctx.answerCbQuery('Token not found', { show_alert: true }); return; }
+      // reply with the explicit token address only
+      await ctx.reply(`Selected explicit token: <code>${found.address || found.mint || found.tokenAddress}</code>`, { parse_mode: 'HTML' });
+      await ctx.answerCbQuery();
+      return;
+    }
+  }catch(e){ try{ await ctx.answerCbQuery(); }catch(_){ } }
+});
+
   // Note: strategy state handlers are registered earlier to avoid duplicate registrations
 
 
@@ -686,9 +856,10 @@ console.log('--- About to launch bot ---');
         const suppressionMs = Math.max(0, suppressionMinutes) * 60 * 1000;
         // require the exported notifier from the listener script (if it's loaded in-process)
         let listenerNotifier: any = null;
-        try{ const seqMod = require('./scripts/sequential_10s_per_program.js'); listenerNotifier = seqMod && seqMod.notifier ? seqMod.notifier : null; }catch(e){}
+      try{ const seqMod = require('./scripts/sequential_10s_per_program.js'); listenerNotifier = seqMod && seqMod.notifier ? seqMod.notifier : null; }catch(e){}
         // register handler on the exported notifier if present
         if(listenerNotifier && typeof listenerNotifier.on === 'function'){
+          const guard = require('./src/bot/telegramGuard').sendNotificationIfExplicit;
           listenerNotifier.on('notification', async (userEvent:any) => {
             try{
               const uid = String(userEvent && userEvent.user);
@@ -700,9 +871,14 @@ console.log('--- About to launch bot ---');
               const maxTrades = Number(user.strategy?.maxTrades || 3) || 3;
               // Always prefer only explicit-created tokens from the collector for listener notifications.
               let tokenObjs = Array.isArray(userEvent.tokens) ? userEvent.tokens.slice(0, maxTrades) : [];
-              try { tokenObjs = (tokenObjs || []).filter((t:any)=> t && t.createdHere === true); } catch(e){}
+              try { const { enforceExplicitTokens } = require('./src/explicit'); tokenObjs = enforceExplicitTokens(tokenObjs || []).slice(0, maxTrades); } catch(e){}
               // Log the incoming notification payload for debugging
               try { console.log(`[NOTIF_IN] user=${uid} program=${userEvent && userEvent.program} signature=${userEvent && userEvent.signature} tokens=${tokenObjs.length}`); } catch(e){}
+              // Debug dump: canonical fields for each token before building message/guard
+              try{
+                const dbg = (tokenObjs || []).map((t:any)=>({ mint: t && (t.mint||t.tokenAddress||t.address), tokenAddress: t && t.tokenAddress, address: t && t.address, createdHere: t && t.createdHere, collectedAtMs: t && t.collectedAtMs }));
+                console.log('[DBG_NOTIF_PAYLOAD]', JSON.stringify(dbg, null, 2));
+              }catch(e){}
               const matchAddrs = tokenObjs.map((t:any) => t && (t.tokenAddress || t.address || t.mint)).filter(Boolean);
               const toSend = [] as string[];
               for (const a of matchAddrs) {
@@ -729,21 +905,13 @@ console.log('--- About to launch bot ---');
                     }
                   }catch(e){}
                 }
-                if(html && typeof html === 'string' && html.length>0){
-                  const options: any = ({ parse_mode: 'HTML', disable_web_page_preview: false } as any);
-                  if(inlineKeyboard) options.reply_markup = { inline_keyboard: inlineKeyboard };
-                  // Log outgoing built payload for review
-                  try { console.log(`[NOTIF_OUT] user=${uid} html_len=${html.length} inline_kb=${inlineKeyboard ? JSON.stringify(inlineKeyboard).slice(0,200) : 'none'}`); } catch(e){}
-                  await (bot.telegram as any).sendMessage(chatId, html, options).catch((err:any)=>{ console.error('[NOTIF_SEND_ERR]', err && (err.message||err)); });
-                } else {
-                  // fallback: simple list message
-                  let text = `🔔 <b>Matched tokens for your strategy</b>\nProgram: <code>${userEvent.program}</code>\nSignature: <code>${userEvent.signature}</code>\n\n`;
-                  text += `Matched (${toSend.length}):\n`;
-                  for(const a of toSend.slice(0,10)) text += `• <code>${a}</code>\n`;
-                  text += `\nTime: ${new Date().toISOString()}`;
-                  try { console.log(`[NOTIF_OUT_FALLBACK] user=${uid} text_snippet=${text.slice(0,200).replace(/\n/g,' ')}`); } catch(e){}
-                  await (bot.telegram as any).sendMessage(chatId, text, ({ parse_mode: 'HTML', disable_web_page_preview: true } as any)).catch((err:any)=>{ console.error('[NOTIF_SEND_ERR]', err && (err.message||err)); });
-                }
+                // Use guard to enforce explicit-only before any send
+                try{
+                  const sent = await guard(bot.telegram, chatId, { html, inlineKeyboard, tokenObjs, userEvent, fallbackText: `ℹ️ Notification suppressed: only explicit-created tokens are allowed.` });
+                  if(!sent) {
+                    // nothing sent (suppressed or no payload)
+                  }
+                }catch(e){}
                 for(const a of toSend) sentNotifications[uid].set(a, Date.now());
               }catch(e){ /* swallow */ }
             }catch(e){ /* swallow per-event errors */ }
@@ -922,10 +1090,19 @@ bot.command('show_token', async (ctx) => {
           usersObj[userId] = user;
           // Use per-user collector so user's strategy fields (minAge/maxAge) are applied at collection time
           const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride, ageOnly: true, onlyPrintExplicit: true }).catch(()=>({}));
-          const entry = collected && collected[userId] ? collected[userId] : null;
-          tokens = (entry && Array.isArray(entry.tokens)) ? entry.tokens.map((it:any)=> Object.assign({ tokenAddress: it.mint || it.tokenAddress || it.address, address: it.mint || it.tokenAddress || it.address, mint: it.mint || it.tokenAddress || it.address, sourceCandidates: true, __listenerCollected: true }, it)) : [];
-          // Only retain explicit-created tokens
-          tokens = (tokens || []).filter((t:any) => t && t.createdHere === true).slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
+          // Normalize & enforce explicit immediately
+          try{
+            const { normalizeTokenForDisplay } = require('./src/utils/tokenUtils');
+            const { enforceExplicitTokens, isExplicitOnly } = require('./src/explicit');
+            const entry = collected && collected[userId] ? collected[userId] : null;
+            let toks = (entry && Array.isArray(entry.tokens)) ? entry.tokens.map((it:any)=> Object.assign({ tokenAddress: it.mint || it.tokenAddress || it.address, address: it.mint || it.tokenAddress || it.address, mint: it.mint || it.tokenAddress || it.address, sourceCandidates: true, __listenerCollected: true }, it)) : [];
+            toks = toks.map((t:any)=> normalizeTokenForDisplay(t));
+            try{ if(isExplicitOnly && isExplicitOnly()) toks = enforceExplicitTokens(toks); }catch(e){}
+            tokens = toks.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
+          }catch(e){
+            const entry = collected && collected[userId] ? collected[userId] : null;
+            tokens = (entry && Array.isArray(entry.tokens)) ? entry.tokens.map((it:any)=> Object.assign({ tokenAddress: it.mint || it.tokenAddress || it.address, address: it.mint || it.tokenAddress || it.address, mint: it.mint || it.tokenAddress || it.address, sourceCandidates: true, __listenerCollected: true }, it)) : [];
+          }
         }
       }catch(e){ listenerAvailable = false; }
       if(listenerAvailable){
@@ -946,10 +1123,11 @@ bot.command('show_token', async (ctx) => {
         // debug: print token provenance & freshness hints
         try{
           for(const t of tokens){
-            try{
-              console.error('[show_token-debug] token', { addr: t.tokenAddress||t.address||t.mint, listenerCollected: !!t.__listenerCollected, freshness: t._canonicalAgeSeconds || t.ageSeconds || t.ageMinutes || null });
-            }catch(e){}
-          }
+              try{
+                const freshness = (t && t.ageSinceCaptureSec !== undefined && t.ageSinceCaptureSec !== null) ? t.ageSinceCaptureSec : (t && t.collectedAtMs ? ((Date.now() - Number(t.collectedAtMs)) / 1000) : (t && (t._canonicalAgeSeconds || t.ageSeconds || t.ageMinutes) || null));
+                console.error('[show_token-debug] token', { addr: t.tokenAddress||t.address||t.mint, listenerCollected: !!t.__listenerCollected, freshness });
+              }catch(e){}
+            }
         }catch(e){}
         // proceed to render below as live results
       } else {

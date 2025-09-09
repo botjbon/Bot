@@ -34,6 +34,7 @@ const EventEmitter = require('events');
 const notifier = new EventEmitter();
 // export notifier when required as a module
 try{ module.exports = module.exports || {}; module.exports.notifier = notifier; }catch(e){}
+try{ module.exports = module.exports || {}; module.exports.LATEST_COLLECTED_OBJ = LATEST_COLLECTED_OBJ; }catch(e){}
 // in-memory per-user notification queues (temporary background memory)
 try{ if(!global.__inMemoryNotifQueues) global.__inMemoryNotifQueues = new Map(); }catch(e){}
 const INMEM_NOTIF_MAX = Number(process.env.NOTIF_INMEM_MAX || 50);
@@ -45,7 +46,9 @@ try{ _tokenUtils = require('../src/utils/tokenUtils'); }catch(e){}
 let MINIMAL_OUTPUT = String(process.env.LISTENER_MINIMAL_OUTPUT || '').toLowerCase() === 'true';
 // When true: only print explicit-created mints (those with clear Initialize/Create markers)
 // Make mutable so callers can override at runtime via startSequentialListener(options)
-let ONLY_PRINT_EXPLICIT = String(process.env.ONLY_PRINT_EXPLICIT || '').toLowerCase() === 'true';
+// Explicit-only mode MUST be enforced for all downstream consumers. Do not allow
+// runtime overrides; always treat collector output as explicit-created only.
+const ONLY_PRINT_EXPLICIT = true;
 
 const PROGRAMS = [
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
@@ -107,6 +110,30 @@ const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 3; // seconds
 const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 10;
 const EXIT_ON_COLLECT = (process.env.EXIT_ON_COLLECT === 'false') ? false : true;
 const LATEST_COLLECTED = [];
+// Keep a parallel recent detailed snapshot of collected token objects (preserves createdHere, collectedAtMs, etc.)
+const LATEST_COLLECTED_OBJ = [];
+// Optional Redis publishing so other processes (bots) can consult the latest collector snapshot
+const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_URI || null;
+let _redisClient = null;
+if(REDIS_URL){
+  try{
+    const { createClient } = require('redis');
+    _redisClient = createClient({ url: REDIS_URL });
+    _redisClient.on && _redisClient.on('error', ()=>{});
+    // connect but don't await to avoid blocking startup; errors are swallowed
+    _redisClient.connect().catch(()=>{});
+  }catch(e){ _redisClient = null; }
+}
+function publishLatestCollectedSnapshot(){
+  try{
+    if(!_redisClient) return;
+    const key = process.env.LATEST_COLLECTED_REDIS_KEY || 'listener:latest_collected_obj';
+    const ttl = Number(process.env.LATEST_COLLECTED_REDIS_TTL || 60);
+    const payload = JSON.stringify(LATEST_COLLECTED_OBJ.slice(0, COLLECT_MAX));
+    // set with expiry so stale processes don't hold on to old snapshots
+    _redisClient.set(key, payload, { EX: ttl }).catch(()=>{});
+  }catch(e){}
+}
 // Capture-only mode: when true the listener writes a minimal capture JSON to disk
 // and skips per-user enrichment/strategy analysis (reduces latency to print/save).
 const CAPTURE_ONLY = (process.env.CAPTURE_ONLY === 'true');
@@ -126,6 +153,8 @@ function computeFirstSigTTL(){
 }
 const FIRST_SIG_MATCH_WINDOW_SECS = Number(process.env.FIRST_SIG_MATCH_WINDOW_SECS) || 6; // allowed delta between firstSig.blockTime and tx.blockTime
 const FIRST_SIG_CACHE = new Map(); // mint -> { sig, blockTime, ts }
+// Window (seconds) after collection during which enrichment is allowed. Set to 2s per request.
+const ENRICH_WINDOW_SEC = Number(process.env.ENRICH_WINDOW_SEC || 2);
 
 // Global listener strict acceptance threshold (seconds). When set, only accept
 // a candidate mint when its first-signature equals the current tx sig AND
@@ -728,8 +757,8 @@ async function startSequentialListener(options){
                         if(firstAddr){
                           const tokenObj = firstAddr; // already a lightweight token object
                             const botUsername = process.env.BOT_USERNAME || 'YourBotUsername';
-                            // Use canonical id for pairAddress argument: prefer mint/tokenAddress/address and avoid pairAddress when possible
-                            const pairAddress = tokenObj.mint || tokenObj.tokenAddress || tokenObj.address || tokenObj.pairAddress || '';
+                            // Use canonical id for pairAddress argument: prefer mint/tokenAddress/address and DO NOT fall back to pairAddress.
+                            const pairAddress = tokenObj.mint || tokenObj.tokenAddress || tokenObj.address || '';
                           try{
                             const built = _tokenUtils.buildTokenMessage(tokenObj, botUsername, pairAddress, uid);
                             if(built && built.msg){ payload.html = built.msg; payload.inlineKeyboard = built.inlineKeyboard || built.inlineKeyboard; }
@@ -922,6 +951,8 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
                       mint: m,
                       firstBlockTime: ft ? Number(ft) * 1000 : null, // ms epoch when available
                       _canonicalAgeSeconds: ageSec,
+                              // timestamp when the collector observed/recorded this token (ms epoch)
+                              collectedAtMs: Date.now(),
                       sourceProgram: p,
                       sourceSignature: sig,
                       kind: kind,
@@ -930,8 +961,21 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
                       createdHere: Boolean(isMintCreatedInThisTx(tx, m)),
                       __listenerCollected: true,
                     };
+                            // compute age since capture and whether enrichment is still allowed
+                            try{ tok._ageSinceCaptureSec = (Date.now() - Number(tok.collectedAtMs)) / 1000; }catch(e){ tok._ageSinceCaptureSec = null; }
+                            try{ tok.enrichAllowed = (ENRICH_WINDOW_SEC <= 0) ? true : (tok._ageSinceCaptureSec !== null && tok._ageSinceCaptureSec <= ENRICH_WINDOW_SEC); }catch(e){ tok.enrichAllowed = false; }
                     collected.push(tok);
                     seenMintsLocal.add(m);
+                    try{
+                      // maintain a small recent snapshot of token objects for fast access by callers
+                      const exists = LATEST_COLLECTED_OBJ.find(o => (o && (o.mint || o.tokenAddress || o.address)) === m);
+                      if(!exists){
+                        LATEST_COLLECTED_OBJ.unshift(tok);
+                        // cap snapshot length
+                        if(LATEST_COLLECTED_OBJ.length > COLLECT_MAX) LATEST_COLLECTED_OBJ.length = COLLECT_MAX;
+                        try{ publishLatestCollectedSnapshot(); }catch(e){}
+                      }
+                    }catch(e){}
                   }
                 }catch(e){ /* invalid mint, skip */ }
               }catch(e){
@@ -946,6 +990,13 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
       if(collected.length >= maxCollect) break;
     }
   }catch(e){}
+  try{
+    // If ONLY_PRINT_EXPLICIT is active, enforce that the collector returns only
+    // tokens that were explicitly created in the discovered transaction (createdHere===true).
+    if(ONLY_PRINT_EXPLICIT) {
+      try{ collected = (Array.isArray(collected) ? collected.filter(c => (c && typeof c === 'object' && c.createdHere === true)) : []); }catch(e){}
+    }
+  }catch(e){}
   return Array.from(new Set(collected)).slice(0, maxCollect);
 }
 module.exports.collectFreshMints = collectFreshMints;
@@ -957,72 +1008,107 @@ async function collectFreshMintsPerUser(usersObj = {}, { maxCollect = 10, timeou
   try{ if(ONLY_PRINT_EXPLICIT) MINIMAL_OUTPUT = true; }catch(e){}
 
   try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG] collectFreshMintsPerUser starting collector for users=${Object.keys(usersObj||{}).length}`); }catch(e){}
-  // Run a single collector pass without per-user age prefiltering so discovery is unbiased
-  const collected = await collectFreshMints({ maxCollect, timeoutMs, strictOverride, ageOnly, onlyPrintExplicit: true });
-  // When explicit-only mode is active, discard any collected items that don't have
-  // a definitive createdHere flag so downstream per-user payloads are authoritative.
-  const pool = Array.isArray(collected) ? collected : [];
-  const poolFiltered = pool.filter(c => {
-    try{
-      if(!c) return false;
-      if(typeof c === 'string') return false; // reject simple-string fallbacks
-      if(ONLY_PRINT_EXPLICIT) return Boolean(c.createdHere);
-      return true;
-    }catch(e){ return false; }
-  });
-  try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG] collected candidates=${poolFiltered.length} (after strict filter) for users=${Object.keys(usersObj||{}).length}`); }catch(e){}
-  const result = {};
+
+  // Build per-user desired counts from usersObj: prefer `strategy.requiredMints`,
+  // fallback to `strategy.maxTrades`, then default to 3.
+  const perUserDesired = {};
   for(const uid of Object.keys(usersObj || {})){
     try{
       const user = usersObj[uid] || {};
-  // ...production: no test-injection hooks here (inject test tokens only during local dev/debug runs)
-      // Allow both `maxAgeSec` (preferred) and legacy `minAge` as the user's age threshold
-      const rawAge = (user && user.strategy && (user.strategy.maxAgeSec !== undefined)) ? user.strategy.maxAgeSec : (user && user.strategy ? user.strategy.minAge : undefined);
-      let userAgeThreshold = null;
+      const s = user.strategy || {};
+      const desired = (s.requiredMints !== undefined && s.requiredMints !== null) ? Number(s.requiredMints) : ((s.maxTrades !== undefined && s.maxTrades !== null) ? Number(s.maxTrades) : 3);
+      perUserDesired[String(uid)] = (isNaN(desired) || desired < 0) ? 0 : Math.max(0, Math.floor(desired));
+    }catch(e){ perUserDesired[String(uid)] = 3; }
+  }
+
+  // Prepare per-user results and tracking structures
+  const assigned = {}; // uid -> Map(mint -> tokenObj)
+  for(const uid of Object.keys(usersObj || {})) assigned[String(uid)] = new Map();
+
+  const startTs = Date.now();
+  const stopAt = Date.now() + (Number(timeoutMs) || 20000);
+  // main loop: keep collecting until every user has their requested count or timeout
+  while(Date.now() < stopAt){
+    // determine how many new tokens to request this iteration: max remaining across users, up to maxCollect
+    let maxNeeded = 0;
+    for(const uid of Object.keys(perUserDesired)){
+      const need = Math.max(0, perUserDesired[uid] - (assigned[uid] ? assigned[uid].size : 0));
+      if(need > maxNeeded) maxNeeded = need;
+    }
+    if(maxNeeded <= 0) break; // everyone satisfied
+
+    const fetchCount = Math.min(Math.max(5, maxNeeded * 2), Math.max(5, maxCollect));
+    const remainingTime = Math.max(1000, stopAt - Date.now());
+    // collect an unbiased batch (explicit-only enforced inside collectFreshMints)
+  const collectorFn = (module.exports && module.exports.collectFreshMints) ? module.exports.collectFreshMints : collectFreshMints;
+  const collected = await collectorFn({ maxCollect: fetchCount, timeoutMs: Math.min(remainingTime, 5000), strictOverride, ageOnly, onlyPrintExplicit: true }).catch(()=>[]);
+    const pool = Array.isArray(collected) ? collected : [];
+    // strict filter: prefer object tokens and require createdHere when explicit-only
+    const poolFiltered = pool.filter(c => {
+      try{ if(!c) return false; if(typeof c === 'string') return false; if(ONLY_PRINT_EXPLICIT) return Boolean(c.createdHere); return true; }catch(e){ return false; }
+    });
+
+    // Print explicit mints array clearly to terminal for observability
+    try{
+      // Suppressed noisy collector explicit array dump per operator request.
+      // const explicitAddrs = poolFiltered.map(t => (t && (t.mint || t.tokenAddress || t.address)) || null).filter(Boolean);
+      // if(explicitAddrs.length > 0){ /* debug output intentionally removed */ }
+    }catch(e){}
+
+    // Assign unique tokens to users up to their desired counts
+    for(const token of poolFiltered){
       try{
-        if(rawAge !== undefined && rawAge !== null && !Number.isNaN(Number(rawAge))){
-          userAgeThreshold = Number(rawAge);
-        } else if(_tokenUtils && typeof _tokenUtils.parseDuration === 'function' && rawAge !== undefined && rawAge !== null){
-          const parsed = _tokenUtils.parseDuration(rawAge);
-          if(parsed !== undefined && parsed !== null && !Number.isNaN(Number(parsed))) userAgeThreshold = Number(parsed);
+        const addr = (token && (token.mint || token.tokenAddress || token.address)) || null;
+        if(!addr) continue;
+        // For each user that still needs this token, add it (ensure uniqueness per user)
+        for(const uid of Object.keys(perUserDesired)){
+          try{
+            const need = Math.max(0, perUserDesired[uid] - (assigned[uid] ? assigned[uid].size : 0));
+            if(need <= 0) continue;
+            if(!assigned[uid].has(addr)){
+              assigned[uid].set(addr, token);
+            }
+          }catch(e){}
         }
       }catch(e){}
-  try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG] user=${uid} rawAge=${String(rawAge)} userAgeThreshold=${String(userAgeThreshold)}`); }catch(e){}
-  const tokens = (Array.isArray(poolFiltered) ? poolFiltered : []).filter(t => {
-        try{
-          const age = (t && t._canonicalAgeSeconds != null) ? Number(t._canonicalAgeSeconds) : null;
-          if(userAgeThreshold !== null){
-            return (age !== null && !isNaN(age) && age <= userAgeThreshold);
-          }
-          return true;
-        }catch(e){ return false; }
-      }).slice(0, 10);
-  try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG] user=${uid} matched_after_age_filter=${tokens.length}`); }catch(e){}
-      result[uid] = { user: String(uid), matched: tokens.map(t => t.mint), tokens };
-      // If there are accepted tokens for this user, print them immediately using the bulleted message template
-      try {
-        if (Array.isArray(tokens) && tokens.length > 0) {
-          // Only print rich LISTENER_MSG blocks when not in minimal mode and not in ONLY_PRINT_EXPLICIT mode
-          if (!MINIMAL_OUTPUT && !ONLY_PRINT_EXPLICIT) {
-            if (_tokenUtils && typeof _tokenUtils.buildBulletedMessage === 'function') {
-              try {
-                const cluster = process.env.SOLANA_CLUSTER || 'mainnet';
-                const title = `Live tokens (listener) for ${uid}`;
-                const { text, inline_keyboard } = _tokenUtils.buildBulletedMessage(tokens, { cluster, title, maxShow: tokens.length });
-                // Print formatted HTML message to stderr (so logs and collectors can capture it)
-                console.error(`[LISTENER_MSG user=${uid}]`);
-                console.error(text);
-                try { console.error('[LISTENER_MSG inline_keyboard]', JSON.stringify(inline_keyboard)); } catch (e) {}
-              } catch (e) { console.error(`[LISTENER_MSG user=${uid}] buildBulletedMessage failed: ${String(e)}`); }
-            } else {
-              // fallback: simple list output
-              try { console.error(`[LISTENER_MSG user=${uid}] accepted tokens: ${tokens.map(t => (t && (t.mint || t.tokenAddress || t.address)) || String(t)).join(', ')}`); } catch (e) {}
-            }
-          }
-        }
-      } catch (e) {}
-    }catch(e){ result[uid] = { user: String(uid), matched: [], tokens: [] }; }
+    }
+
+    // Check if all users satisfied
+    let allSatisfied = true;
+    for(const uid of Object.keys(perUserDesired)){
+      const need = Math.max(0, perUserDesired[uid] - (assigned[uid] ? assigned[uid].size : 0));
+      if(need > 0) { allSatisfied = false; break; }
+    }
+    if(allSatisfied) break;
+
+    // small delay before next iteration
+    await sleep(250);
   }
+
+  // Build result object per user and include a unique userMessage with their addresses
+  const result = {};
+  for(const uid of Object.keys(usersObj || {})){
+    try{
+      const map = assigned[uid] || new Map();
+      const tokens = Array.from(map.values()).slice(0, 50);
+      // attach computed per-token fields similar to previous behavior
+      for(const t of tokens){
+        try{
+          let ageSinceCapture = null;
+          if(t && t.collectedAtMs) ageSinceCapture = (Date.now() - Number(t.collectedAtMs)) / 1000;
+          else if(t && t._canonicalAgeSeconds != null) ageSinceCapture = Number(t._canonicalAgeSeconds);
+          t.ageSinceCaptureSec = (ageSinceCapture !== null && !isNaN(ageSinceCapture)) ? Number(ageSinceCapture) : null;
+          t.enrichAllowed = (typeof t.collectedAtMs !== 'undefined') ? ((ENRICH_WINDOW_SEC <= 0) ? true : (t.ageSinceCaptureSec !== null && t.ageSinceCaptureSec <= ENRICH_WINDOW_SEC)) : false;
+        }catch(e){ t.ageSinceCaptureSec = null; t.enrichAllowed = false; }
+      }
+      const addrs = tokens.map(t => (t && (t.mint || t.tokenAddress || t.address)) || null).filter(Boolean);
+      // unique addresses and deterministic order
+      const uniqueAddrs = Array.from(new Set(addrs));
+      const userMessage = uniqueAddrs.length > 0 ? `Collected explicit tokens for user ${uid}: ${uniqueAddrs.join(', ')}` : `No explicit tokens collected for user ${uid}`;
+      result[uid] = { user: String(uid), matched: uniqueAddrs, tokens, userMessage, count: uniqueAddrs.length };
+    }catch(e){ result[uid] = { user: String(uid), matched: [], tokens: [], userMessage: `No explicit tokens collected for user ${uid}`, count: 0 }; }
+  }
+
   return result;
 }
 module.exports.collectFreshMintsPerUser = collectFreshMintsPerUser;

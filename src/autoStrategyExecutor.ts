@@ -26,8 +26,8 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
 
   for (const token of tokensToTrade) {
     try {
-      // Get token address (mint/address/tokenAddress/pairAddress)
-      const tokenAddress = getField(token, 'mint', 'address', 'tokenAddress', 'pairAddress');
+  // Get token address (mint/address/tokenAddress)
+  const tokenAddress = getField(token, 'mint', 'address', 'tokenAddress');
       if (!tokenAddress) {
         console.warn(`[autoExecute] No valid address for token`, token);
         continue;

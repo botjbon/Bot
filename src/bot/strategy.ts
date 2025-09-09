@@ -465,19 +465,29 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
       const concurrency = Math.max(1, Number(process.env.STRATEGY_ENRICH_CONCURRENCY || 3));
       const timeoutMs = Number(process.env.STRATEGY_ENRICH_TIMEOUT_MS || 2000);
       const candidates = prelim.slice(0, Math.min(candidateLimit, prelim.length));
+      // filter out tokens that are outside listener enrichment window
+      const filteredCandidates = candidates.filter(t => !(t && t.enrichAllowed === false));
+      const finalCandidates = filteredCandidates.length ? filteredCandidates : candidates;
       if (candidates.length) {
         let idx = 0;
-        const worker = async () => {
+          const worker = async () => {
           while (true) {
             const i = idx++;
             if (i >= candidates.length) break;
             const tok = candidates[i];
             try {
               __strategy_enrich_metrics.attempts++;
+              // Skip heavy enrichment when token explicitly disallows enrichment (listener window expired)
+              const tokenObj = tok as any;
+              if (tokenObj && tokenObj.enrichAllowed === false) {
+                // treat as skipped
+                __strategy_enrich_metrics.failures++;
+                continue;
+              }
               // officialEnrich mutates the token in-place with poolOpenTimeMs, liquidity, volume, freshnessScore
-              await tu.officialEnrich(tok, { amountUsd: Number(strategy.buyAmount) || undefined, timeoutMs });
+              await tu.officialEnrich(tokenObj, { amountUsd: Number(strategy.buyAmount) || undefined, timeoutMs });
               // heuristics: consider enrichment successful if we obtained any of these fields
-              if (tok && (tok.poolOpenTimeMs || tok.liquidity || tok.volume || tok._canonicalAgeSeconds)) {
+              if (tokenObj && (tokenObj.poolOpenTimeMs || tokenObj.liquidity || tokenObj.volume || tokenObj._canonicalAgeSeconds)) {
                 __strategy_enrich_metrics.successes++;
                 __strategy_enrich_metrics.enrichedTokens++;
               } else {
@@ -493,9 +503,9 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
         try { await Promise.all(workers); } catch (e) {}
         // merge enriched candidates back into prelim by canonical address
         try {
-          const keyOf = (t: any) => String(t && (t.tokenAddress || t.address || t.mint || t.pairAddress || '')).toLowerCase();
+          const keyOf = (t: any) => String(t && (t.tokenAddress || t.address || t.mint || '')).toLowerCase();
           const enrichedMap: Record<string, any> = {};
-          for (const e of candidates) {
+          for (const e of finalCandidates) {
             const k = keyOf(e);
             if (k) enrichedMap[k] = e;
           }
@@ -525,8 +535,15 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
 
     // Age checks: compute age in seconds with no integer-flooring to preserve fractional minutes/seconds
   let ageSeconds: number | undefined = undefined;
-    // Prefer canonical age if present (set by merge/ensureCanonicalOnchainAges)
-    if (token && token._canonicalAgeSeconds !== undefined && token._canonicalAgeSeconds !== null) {
+    // Prefer capture-based age when available (listener capture time). This reflects "age since collectFreshMints".
+    if (token && token.ageSinceCaptureSec !== undefined && token.ageSinceCaptureSec !== null) {
+      ageSeconds = Number(token.ageSinceCaptureSec);
+    } else if (token && token.collectedAtMs) {
+      try {
+        const collectedMs = Number(token.collectedAtMs);
+        if (!isNaN(collectedMs) && collectedMs > 0) ageSeconds = (Date.now() - collectedMs) / 1000;
+      } catch (e) { /* ignore */ }
+    } else if (token && token._canonicalAgeSeconds !== undefined && token._canonicalAgeSeconds !== null) {
       ageSeconds = Number(token._canonicalAgeSeconds);
     }
     const ageVal = getField(token,
@@ -571,7 +588,7 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
     const maxAgeSec = (strategy as any)?.maxAgeSec !== undefined ? Number((strategy as any).maxAgeSec) : undefined;
     if (maxAgeSec !== undefined && !isNaN(maxAgeSec)) {
       if (ageSeconds === undefined || isNaN(ageSeconds)) {
-        // Require known on-chain age when a maxAgeSec > 0 is requested
+        // Require known age when a maxAgeSec > 0 is requested (prefer capture-based age)
         if (maxAgeSec > 0) return false;
       } else {
         if (ageSeconds > maxAgeSec) return false;

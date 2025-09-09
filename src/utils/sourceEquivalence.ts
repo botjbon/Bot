@@ -14,7 +14,7 @@ export function compareSourcesForCache(cache: any[]): EquivalenceEntry[] {
   const out: EquivalenceEntry[] = [];
   for (const item of cache) {
     try {
-      const addr = item && (item.tokenAddress || item.address || item.mint || item.pairAddress);
+  const addr = item && (item.tokenAddress || item.address || item.mint);
       if (!addr) continue;
       const srcs = Array.isArray(item.__sources) ? item.__sources : (item.__sources ? [item.__sources] : []);
       if (!srcs || srcs.length < 2) continue;

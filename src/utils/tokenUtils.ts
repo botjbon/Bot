@@ -84,6 +84,7 @@ try {
   }
 } catch (e) {}
 import axios from 'axios';
+import { enforceExplicitTokens, isExplicitOnly } from '../explicit';
 import { Connection, PublicKey } from '@solana/web3.js';
 import fs from 'fs';
 import path from 'path';
@@ -210,6 +211,19 @@ export function nice(v: any) {
   return (v === undefined || v === null || v === 'Not available') ? '—' : v;
 }
 
+// Escape text used inside Telegram HTML parse_mode to avoid malformed markup
+function escHtml(s: any): string {
+  if (s === undefined || s === null) return '';
+  try {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  } catch (e) { return String(s); }
+}
+
 // Parse duration input (supports numbers and strings like '30s','5m','2h')
 export function parseDuration(v: string | number | undefined | null): number | undefined {
   if (v === undefined || v === null || v === '') return undefined;
@@ -295,6 +309,25 @@ export async function retryAsync<T>(fn: () => Promise<T>, retries = 0, delayMs =
   throw lastErr;
 }
 
+/**
+ * Ensure a token object has canonical address fields for display: { mint, tokenAddress, address }
+ * Prefer existing mint -> tokenAddress -> address values and coerce string tokens into objects.
+ */
+export function normalizeTokenForDisplay(raw: any): { mint?: string; tokenAddress?: string; address?: string; [k:string]: any } {
+  try{
+    if(!raw) return {};
+    // If raw is a simple string, treat it as the mint
+    if (typeof raw === 'string') {
+      return { mint: raw, tokenAddress: raw, address: raw };
+    }
+    const out: any = Object.assign({}, raw);
+    // Only accept canonical on-chain address fields. Do NOT derive from URLs or pairAddress.
+  const addr = raw.mint || raw.tokenAddress || raw.address || null;
+    if(addr) { out.mint = out.mint || addr; out.tokenAddress = out.tokenAddress || addr; out.address = out.address || addr; }
+    return out;
+  }catch(e){ return raw || {}; }
+}
+
 
 // ========== Fetch token data from CoinGecko and DexScreener ==========
 export async function fetchSolanaFromCoinGecko(): Promise<any> {
@@ -367,6 +400,30 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
     } catch (e) {}
   const items: any[] = await seq.collectFreshMints({ maxCollect, timeoutMs, maxAgeSec, strictOverride, onlyPrintExplicit: true }).catch(() => []);
     if (!Array.isArray(items) || items.length === 0) return [];
+    // Normalize collector results immediately and enforce explicit-only policy
+    try {
+      const { normalizeTokenForDisplay } = require('./src/utils/tokenUtils');
+    } catch(e){}
+    try {
+      const { normalizeTokenForDisplay } = require('./src/utils/tokenUtils');
+      const { enforceExplicitTokens, isExplicitOnly } = require('../explicit');
+      let tmp = items.map((it: any) => normalizeTokenForDisplay(it));
+      if (isExplicitOnly && typeof isExplicitOnly === 'function' ? isExplicitOnly() : true) {
+        try { tmp = enforceExplicitTokens(tmp); } catch(e){}
+      }
+      // reuse normalized/enforced tmp for return mapping
+      const mapped = tmp.map((it: any) => {
+      // listener may return either simple mint strings or enriched token objects
+      if (!it) return null;
+      if (typeof it === 'string') return { tokenAddress: it, address: it, mint: it, sourceCandidates: true, __listenerCollected: true };
+      // merge and normalize fields
+      const addr = it.tokenAddress || it.address || it.mint || null;
+      return Object.assign({ tokenAddress: addr, address: addr, mint: addr, sourceCandidates: true, __listenerCollected: true }, it);
+    }).filter(Boolean);
+      return mapped;
+    } catch (e) {
+      // Fallback: original mapping when normalization/enforce fails
+    }
     return items.map((it: any) => {
       // listener may return either simple mint strings or enriched token objects
       if (!it) return null;
@@ -881,7 +938,7 @@ export async function getFirstOnchainTimestamp(address: string, opts?: { timeout
  * Attaches token.freshnessScore and token.freshnessDetails for downstream use.
  */
 export async function computeFreshnessScore(token: any): Promise<{ score: number; details: any }> {
-  const addr = token?.tokenAddress || token?.address || token?.mint || token?.pairAddress;
+  const addr = token?.tokenAddress || token?.address || token?.mint;
   const now = Date.now();
   // Candidate timestamps
   const dsTs = token?.poolOpenTimeMs || token?.pairCreatedAt || token?.pairCreatedAtMs || null;
@@ -960,7 +1017,7 @@ export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: 
   // Build canonical address -> token map
   const addrMap = new Map<string, any>();
   for (const t of tokens) {
-    const key = t.tokenAddress || t.address || t.mint || t.pairAddress;
+  const key = t.tokenAddress || t.address || t.mint;
     if (key) addrMap.set(key, t);
   }
   // Rank candidates by liquidity then volume (desc)
@@ -1036,7 +1093,7 @@ export async function officialEnrich(token: any, opts?: { amountUsd?: number; ti
   return onchainLimiter.enqueue(async () => {
     try {
       // Ensure token has canonical address
-      const addr = token.tokenAddress || token.address || token.mint || token.pairAddress;
+  const addr = token.tokenAddress || token.address || token.mint;
       if (!addr) return token;
         // In listener-only mode skip heavy enrichment and external Jupiter checks
         if (!LISTENER_ONLY_MODE) {
@@ -1076,31 +1133,36 @@ export function fmt(val: number | string | undefined | null, digits?: number, un
 // --- Helper functions for building the message ---
 
 function buildInlineKeyboard(token: any, botUsername: string, pairAddress: string, userId?: string) {
-  // Only expose external links for tokens explicitly created in the discovered tx
+  // Only expose buttons/links for tokens that the collector marked as explicitly created.
+  // Do NOT construct or fallback to pairAddress-derived links or extract addresses from token.url.
   const isExplicit = Boolean(token && token.createdHere === true);
-  // For explicit tokens prefer token.url only; avoid constructing dexscreener links from pairAddress
-  // because pairAddress may be a liquidity/pair id or a program address unrelated to the mint.
-  const dexUrl = isExplicit ? (token.url || '') : (token.url || (pairAddress ? `https://dexscreener.com/solana/${pairAddress}` : ''));
   const twitterEmoji = '🐦', dexEmoji = '🧪', shareEmoji = '📤';
   const inlineKeyboard: any[][] = [];
-  // Row 1: Twitter, DexScreener (only if available)
+
+  // Row 1: Twitter links (if present)
   const row1: any[] = [];
   if (Array.isArray(token.links)) {
     for (const l of token.links) {
-      if (l.type === 'twitter' && l.url) row1.push({ text: `${twitterEmoji} Twitter`, url: l.url });
+      if (l && l.type === 'twitter' && typeof l.url === 'string' && l.url.length) row1.push({ text: `${twitterEmoji} Twitter`, url: l.url });
     }
   }
-  if (dexUrl) row1.push({ text: `${dexEmoji} DexScreener`, url: dexUrl });
-  if (row1.length) inlineKeyboard.push(row1);
-  // Row 2: Share button (external share link)
-  // Only add a Share button when the token is explicit and has a valid id
-  if (isExplicit) {
-  // Use canonical token id for sharing: prefer mint/tokenAddress/address and *avoid* pairAddress when explicit
-  let shareId = userId || token._userId || (token.mint || token.tokenAddress || token.address || token.pairAddress || '');
-    const shareUrl = `https://t.me/share/url?url=https://t.me/${botUsername}?start=${shareId}`;
-    const row2: any[] = [ { text: `${shareEmoji} Share`, url: shareUrl } ];
-    inlineKeyboard.push(row2);
+
+  // Only add a DexScreener/extern link when the token is explicit AND token.url is provided by the collector/enrichment.
+  if (isExplicit && token && typeof token.url === 'string' && token.url.length) {
+    row1.push({ text: `${dexEmoji} DexScreener`, url: token.url });
   }
+
+  if (row1.length) inlineKeyboard.push(row1);
+
+  // Row 2: Share button (external share link) - only for explicit tokens and only using canonical ids (mint/tokenAddress/address)
+  if (isExplicit) {
+    const shareId = String(userId || token._userId || token.mint || token.tokenAddress || token.address || '');
+    if (shareId && shareId.length) {
+      const shareUrl = `https://t.me/share/url?url=https://t.me/${botUsername}?start=${shareId}`;
+      inlineKeyboard.push([ { text: `${shareEmoji} Share`, url: shareUrl } ]);
+    }
+  }
+
   return { inlineKeyboard };
 }
 
@@ -1109,38 +1171,52 @@ function getTokenCoreFields(token: any) {
   return {
     name: token.name || token.baseToken?.name || '',
     symbol: token.symbol || token.baseToken?.symbol || '',
-  // Prefer on-chain mint/tokenAddress/address as the canonical address. Avoid pairAddress for explicit tokens.
-  address: token.mint || token.tokenAddress || token.address || token.url?.split('/').pop() || token.pairAddress || '',
-  // Prefer an explicit token.url when present. Only fallback to pairAddress-based dexscreener URL
-  // for non-explicit tokens or when token.url is not available.
-  dexUrl: token.url || (token.pairAddress ? `https://dexscreener.com/solana/${token.pairAddress}` : ''),
+    // Canonical address: accept only explicit on-chain fields provided by the collector/enrichment.
+    // Do NOT derive address from pairAddress or by parsing URLs.
+    address: token.mint || token.tokenAddress || token.address || '',
+    // dexUrl is only trusted when explicitly provided on the token object by the collector/enrichment.
+    dexUrl: (typeof token.url === 'string' && token.url.length) ? token.url : '',
     logo: token.imageUrl || token.logoURI || token.logo || token.baseToken?.logoURI || ''
   };
 }
 
 function getTokenStats(token: any) {
-  const price = extractNumeric(getField(token, 'priceUsd', 'price', 'baseToken.priceUsd', 'baseToken.price'), 0);
-  const marketCap = extractNumeric(getField(token, 'marketCap'));
-  const liquidity = extractNumeric(getField(token, 'liquidity'));
-  const volume = extractNumeric(getField(token, 'volume'));
-  const holders = extractNumeric(getField(token, 'holders'));
+  // Extract numeric stat fields up-front so template consumers receive consistent values.
+  const price = extractNumeric(getField(token, 'price', 'priceUsd', 'priceUsdFloat', 'priceFloat')) || undefined;
+  const marketCap = extractNumeric(getField(token, 'marketCap', 'fdv', 'totalAmount', 'amount')) || undefined;
+  const liquidity = extractNumeric(getField(token, 'liquidity', 'liquidityUsd')) || undefined;
+  const volume = extractNumeric(getField(token, 'volume', 'amount', 'totalAmount')) || undefined;
+  const holders = extractNumeric(getField(token, 'holders')) || undefined;
+
   // Prefer canonical on-chain age fields (seconds) when available to avoid unit confusion.
   let ageDisplay: string = 'Not available';
   let ageMs: number | undefined = undefined;
-  // canonical seconds sources
-  const canonSec = (token && token._canonicalAgeSeconds !== undefined && token._canonicalAgeSeconds !== null) ? Number(token._canonicalAgeSeconds) :
-                    (typeof token.ageSeconds === 'number' && !isNaN(token.ageSeconds) ? Number(token.ageSeconds) : undefined);
-  if (canonSec !== undefined && !isNaN(canonSec)) {
-    if (canonSec >= 0) ageMs = Math.floor(canonSec * 1000);
-  } else {
-    // fallback: legacy 'age' or 'createdAt' fields
-    let age = getField(token, 'age', 'createdAt');
-    if (typeof age === 'string') age = Number(age);
-    if (typeof age === 'number' && !isNaN(age)) {
-      if (age > 1e12) ageMs = Date.now() - age; // ms timestamp
-      else if (age > 1e9) ageMs = Date.now() - age * 1000; // s timestamp
-      else if (age < 1e7 && age > 0) ageMs = age * 60 * 1000; // minutes
+  // Prefer capture-based age when present (ageSinceCaptureSec or collectedAtMs).
+  try {
+    if (token && typeof token.ageSinceCaptureSec === 'number' && !isNaN(token.ageSinceCaptureSec)) {
+      if (token.ageSinceCaptureSec >= 0) ageMs = Math.floor(Number(token.ageSinceCaptureSec) * 1000);
+    } else if (token && (token.collectedAtMs !== undefined && token.collectedAtMs !== null)) {
+      const ms = Number(token.collectedAtMs);
+      if (!isNaN(ms) && ms > 0) ageMs = Date.now() - ms;
+    } else {
+      // canonical seconds sources (on-chain/fast fetch)
+      const canonSec = (token && token._canonicalAgeSeconds !== undefined && token._canonicalAgeSeconds !== null) ? Number(token._canonicalAgeSeconds) :
+                        (typeof token.ageSeconds === 'number' && !isNaN(token.ageSeconds) ? Number(token.ageSeconds) : undefined);
+      if (canonSec !== undefined && !isNaN(canonSec)) {
+        if (canonSec >= 0) ageMs = Math.floor(canonSec * 1000);
+      } else {
+        // fallback: legacy 'age' or 'createdAt' fields
+        let age = getField(token, 'age', 'createdAt');
+        if (typeof age === 'string') age = Number(age);
+        if (typeof age === 'number' && !isNaN(age)) {
+          if (age > 1e12) ageMs = Date.now() - age; // ms timestamp
+          else if (age > 1e9) ageMs = Date.now() - age * 1000; // s timestamp
+          else if (age < 1e7 && age > 0) ageMs = age * 60 * 1000; // minutes
+        }
+      }
     }
+  } catch (e) {
+    ageMs = undefined;
   }
   if (typeof ageMs === 'number' && !isNaN(ageMs) && ageMs > 0) {
     const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
@@ -1207,6 +1283,8 @@ function buildExtraFields(token: any) {
 }
 
 export function buildTokenMessage(token: any, botUsername: string, pairAddress: string, userId?: string): { msg: string, msgMarkdown?: string, inlineKeyboard: any[][] } {
+  // Defensive normalization: ensure canonical fields are present before building message
+  try { token = normalizeTokenForDisplay(token); } catch (e) {}
   const { name, symbol, address, dexUrl, logo } = getTokenCoreFields(token);
   const { price, marketCap, liquidity, volume, holders, ageDisplay } = getTokenStats(token);
   const { buyVol, sellVol } = getTokenBuySell(token);
@@ -1217,9 +1295,9 @@ export function buildTokenMessage(token: any, botUsername: string, pairAddress: 
   const nice = (v: any) => (v === undefined || v === null || v === 'Not available') ? '—' : v;
   // Title
   const isExplicit = Boolean(token && token.createdHere === true);
-  msg += `🪙 ${solEmoji} <b>${name ? name : 'Unknown'}</b>${symbol ? ' <code>' + symbol + '</code>' : ''}`;
+  msg += `🪙 ${solEmoji} <b>${escHtml(name ? name : 'Unknown')}</b>${symbol ? ' <code>' + escHtml(symbol) + '</code>' : ''}`;
   msg += isExplicit ? ` <b>🔒 Explicit</b>\n` : ` <i>Not explicit</i>\n`;
-  msg += `${linkEmoji} <b>Address:</b> <code>${address ? address : 'N/A'}</code>\n\n`;
+  msg += `${linkEmoji} <b>Address:</b> <code>${escHtml(address ? address : 'N/A')}</code>\n\n`;
   // --- Stats (compact, human friendly) ---
   msg += `${capEmoji} <b>Market Cap:</b> ${nice(fmtField(marketCap, 'marketCap'))} USD\n`;
   msg += `${liqEmoji} <b>Liquidity:</b> ${nice(fmtField(liquidity, 'liquidity'))} USD  `;
@@ -1258,7 +1336,7 @@ export function buildTokenMessage(token: any, botUsername: string, pairAddress: 
     msg += buildExtraFields(extras);
   }
   // --- Description ---
-  if (token.description) msg += `\n<em>${token.description}</em>\n`;
+  if (token.description) msg += `\n<em>${escHtml(token.description)}</em>\n`;
   // --- Network line ---
   if (token.chainId || token.chain || token.chainName) {
     const network = token.chainId || token.chain || token.chainName;
@@ -1295,11 +1373,12 @@ export function buildTokenMessage(token: any, botUsername: string, pairAddress: 
 
 // Build a concise preview message used in fast previews and notifications
 export function buildPreviewMessage(token: any): { title: string; addr: string; price: string; url?: string; shortMsg: string } {
-  const addr = token.mint || token.tokenAddress || token.address || token.pairAddress || 'N/A';
+  // Preview MUST use canonical explicit addresses only. Do not fall back to pairAddress-derived URLs.
+  const addr = token.mint || token.tokenAddress || token.address || 'N/A';
   const name = token.name || token.symbol || addr;
   const priceNum = token.priceUsd || token.price || token.priceUsdFloat || token.priceFloat;
   const price = (typeof priceNum === 'number') ? priceNum.toLocaleString(undefined, { maximumFractionDigits: 8 }) : (priceNum ? String(priceNum) : 'N/A');
-  const url = token.url || (token.pairAddress ? `https://dexscreener.com/solana/${token.pairAddress}` : undefined);
+  const url = (typeof token.url === 'string' && token.url.length) ? token.url : undefined;
   // Include source program/signature when available (useful for listener-sourced candidates)
   let srcLine = '';
   try {
@@ -1309,7 +1388,22 @@ export function buildPreviewMessage(token: any): { title: string; addr: string; 
     if (sig) srcLine += ` | Sig: ${sig}`;
   } catch (e) {}
   const shortMsg = `🪙 ${name} (${addr})\nPrice: ${price} USD${url ? '\n' + url : ''}${srcLine}`;
-  return { title: name, addr, price, url, shortMsg };
+  // Append a short age hint when capture/on-chain age is available so previews show freshness
+  try {
+    let ageHint = '';
+    if (token && typeof token.ageSinceCaptureSec === 'number' && !isNaN(token.ageSinceCaptureSec)) {
+      ageHint = ` | age: ${Math.floor(Number(token.ageSinceCaptureSec))}s`;
+    } else if (token && (token.collectedAtMs !== undefined && token.collectedAtMs !== null)) {
+      const a = Math.floor((Date.now() - Number(token.collectedAtMs)) / 1000);
+      if (!isNaN(a)) ageHint = ` | age: ${a}s`;
+    } else if (token && token._canonicalAgeSeconds !== undefined && token._canonicalAgeSeconds !== null) {
+      const a = Number(token._canonicalAgeSeconds);
+      if (!isNaN(a)) ageHint = ` | age: ${Math.floor(a)}s`;
+    }
+    return { title: name, addr, price, url, shortMsg: shortMsg + (ageHint ? `\n${ageHint}` : '') };
+  } catch (e) {
+    return { title: name, addr, price, url, shortMsg };
+  }
 }
 
 // Build a bulleted HTML message and inline keyboard for a list of tokens.
@@ -1324,7 +1418,10 @@ export function buildBulletedMessage(tokens: any[], opts?: { cluster?: string; t
   const signature = opts?.signature || (Array.isArray(tokens) && tokens.length && (tokens[0].signature || tokens[0].sourceSignature)) || undefined;
 
   // By default only include tokens explicitly created in the discovered tx (createdHere === true)
-  const allowNonExplicit = (opts && (opts as any).allowNonExplicit) === true;
+  // Honor global explicit-only mode: when ONLY_PRINT_EXPLICIT is set, callers cannot override
+  // Force explicit-only globally for the running bot: do not allow callers to override.
+  const onlyExplicitEnv = true;
+  const allowNonExplicit = onlyExplicitEnv ? false : ((opts && (opts as any).allowNonExplicit) === true);
   const filteredTokens = Array.isArray(tokens) ? tokens.filter(t => { try { if (!t) return false; if (allowNonExplicit) return true; return Boolean(t.createdHere === true); } catch (e) { return false; } }) : [];
   // Header
   let text = `🔔 <b>${title}${opts && (opts as any).forUser ? ' for ' + (opts as any).forUser : ''}</b>\nFound ${filteredTokens.length} candidate(s) (showing ${Math.min(filteredTokens.length, maxShow)}):\n`;
@@ -1338,33 +1435,30 @@ export function buildBulletedMessage(tokens: any[], opts?: { cluster?: string; t
   for (let i = 0; i < Math.min(filteredTokens.length, maxShow); i++) {
     const t = filteredTokens[i];
     try {
-      // Use the rich single-token template for each token
-  const pairAddress = t.pairAddress || t.tokenAddress || t.address || t.mint || '';
-      const built = buildTokenMessage(t, botUsername, pairAddress, undefined);
-      if (built && typeof built.msg === 'string') {
-        // Separate items with two newlines for readability
-        text += `\n• ${built.msg}\n`;
-      } else {
-        // Fallback to preview line
-        const preview = buildPreviewMessage(t);
-        const addr = preview.addr || '<unknown>';
-        text += `\n• <b>${preview.title}</b> <code>${addr}</code>\n${preview.shortMsg}\n`;
-      }
-      // Merge inline keyboard rows if present
-  if (built && Array.isArray(built.inlineKeyboard)) {
-        for (const row of built.inlineKeyboard) {
-          if (Array.isArray(row) && row.length) inline_keyboard.push(row);
+      // Use compact previews for multi-token lists to keep messages short.
+      const preview = buildPreviewMessage(t);
+      const addr = preview.addr || '<unknown>';
+      text += `\n• <b>${escHtml(preview.title)}</b> <code>${escHtml(addr)}</code>\n${escHtml(preview.shortMsg)}\n`;
+      // Merge inline keyboard rows from the full token template if present
+      try {
+        const canonicalId = t.tokenAddress || t.address || t.mint || '';
+        const built = buildTokenMessage(t, botUsername, canonicalId, undefined);
+        if (built && Array.isArray(built.inlineKeyboard)) {
+          for (const row of built.inlineKeyboard) {
+            if (Array.isArray(row) && row.length) inline_keyboard.push(row);
+          }
         }
-      } else if (pairAddress) {
-        // fallback: add an explorer button row
-        const explorerBase = (cluster === 'devnet') ? 'https://explorer.solana.com' : 'https://explorer.solana.com';
-  inline_keyboard.push([{ text: `🔎 ${t.name || pairAddress}`, url: `${explorerBase}/address/${pairAddress}?cluster=${cluster}` }]);
-      }
+      } catch (e) {}
     } catch (e) {
       const addr = t && (t.tokenAddress || t.address || t.mint) || 'unknown';
       text += `\n• <code>${addr}</code>\n`;
-      const explorerBase = (cluster === 'devnet') ? 'https://explorer.solana.com' : 'https://explorer.solana.com';
-      inline_keyboard.push([{ text: `🔎 ${addr}`, url: `${explorerBase}/address/${addr}?cluster=${cluster}` }]);
+      // Do NOT add explorer button for pairAddress-derived ids; only add if canonical addr exists
+      try {
+        if (addr && addr !== 'unknown') {
+          const explorerBase = (cluster === 'devnet') ? 'https://explorer.solana.com' : 'https://explorer.solana.com';
+          inline_keyboard.push([{ text: `🔎 ${addr}`, url: `${explorerBase}/address/${addr}?cluster=${cluster}` }]);
+        }
+      } catch (_e) {}
     }
   }
 
@@ -1384,9 +1478,13 @@ export async function notifyUsers(bot: any, users: Record<string, any>, tokens: 
   // explicitly created in the discovered tx (createdHere === true). This prevents
   // external quick-sources (DexScreener, etc.) from being sent to users when the
   // system is operating in explicit-only mode.
-  try {
-    const onlyExplicit = (process.env.ONLY_PRINT_EXPLICIT === 'true' || process.env.ONLY_PRINT_EXPLICIT === '1');
-    if (onlyExplicit) tokens = Array.isArray(tokens) ? tokens.filter(t => t && t.createdHere === true) : [];
+    try {
+    const onlyExplicit = isExplicitOnly();
+    // Normalize tokens defensively so downstream builders see canonical fields
+    try{
+      tokens = Array.isArray(tokens) ? tokens.map((t:any)=> normalizeTokenForDisplay(t)) : tokens;
+    }catch(e){}
+    if (onlyExplicit) tokens = Array.isArray(tokens) ? enforceExplicitTokens(tokens) : [];
   } catch (e) {}
   for (const uid of Object.keys(users)) {
     const strategy: Record<string, any> = users[uid]?.strategy || {};
@@ -1401,10 +1499,11 @@ export async function notifyUsers(bot: any, users: Record<string, any>, tokens: 
         // nothing for this chain
       } else if (solFiltered.length === 1) {
         const token = solFiltered[0];
-        let botUsername = (bot && bot.botInfo && bot.botInfo.username) ? bot.botInfo.username : (process.env.BOT_USERNAME || 'YourBotUsername');
-        const address = token.tokenAddress || token.address || token.mint || token.pairAddress || 'N/A';
-        const pairAddress = token.pairAddress || address;
-        const singleMsg = buildTokenMessage(token, botUsername, pairAddress);
+      let botUsername = (bot && bot.botInfo && bot.botInfo.username) ? bot.botInfo.username : (process.env.BOT_USERNAME || 'YourBotUsername');
+    // Only use canonical on-chain fields for addresses. Do NOT fallback to pairAddress.
+    const address = token.tokenAddress || token.address || token.mint || 'N/A';
+    const pairAddress = address; // pass canonical id as pairAddress param but do not use token.pairAddress
+    const singleMsg = buildTokenMessage(token, botUsername, pairAddress);
         if (typeof singleMsg.msg !== 'string') {
           await bot.telegram.sendMessage(uid, '⚠️ We are still looking for the gems you want.');
         } else {
@@ -1420,8 +1519,8 @@ export async function notifyUsers(bot: any, users: Record<string, any>, tokens: 
           for (const token of solFiltered) {
             try {
               let botUsername = (bot && bot.botInfo && bot.botInfo.username) ? bot.botInfo.username : (process.env.BOT_USERNAME || 'YourBotUsername');
-              const address = token.tokenAddress || token.address || token.mint || token.pairAddress || 'N/A';
-              const pairAddress = token.pairAddress || address;
+              const address = token.tokenAddress || token.address || token.mint || 'N/A';
+              const pairAddress = address;
               const singleMsg = buildTokenMessage(token, botUsername, pairAddress);
               if (typeof singleMsg.msg === 'string') await bot.telegram.sendMessage(uid, singleMsg.msg, ({ parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard: singleMsg.inlineKeyboard } } as any));
             } catch (e2) {}

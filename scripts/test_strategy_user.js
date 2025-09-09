@@ -27,6 +27,6 @@ const { filterTokensByStrategy } = require('../dist/src/bot/strategy');
   if (!user) { console.error('user not found'); process.exit(1); }
   const filtered = await filterTokensByStrategy(tokens, user.strategy, { preserveSources: true });
   console.log('filtered tokens count:', filtered.length);
-  const addrs = filtered.map(t=>t.tokenAddress || t.address || t.mint || t.token || t.pairAddress).filter(Boolean).slice(0,20);
+  const addrs = filtered.map(t=>t.tokenAddress || t.address || t.mint || t.token).filter(Boolean).slice(0,20);
   console.log('addresses:', addrs);
 })();

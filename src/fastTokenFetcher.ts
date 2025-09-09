@@ -102,6 +102,12 @@ export function hashTokenAddress(addr: string) {
 // Controlled via env LISTENER_ONLY_MODE or LISTENER_ONLY. Default to true.
 const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
 
+// Force Telegram explicit-only policy for discovery messages. This makes the
+// collector/listener the single authoritative source for tokens delivered to
+// Telegram users and prevents fast-path modules from directly sending token
+// discovery messages. This is intentionally hard-coded (no runtime toggle).
+const TELEGRAM_EXPLICIT_ONLY = true;
+
 async function ensureSentDir() {
   const sent = path.join(process.cwd(), 'sent_tokens');
   try {
@@ -234,42 +240,38 @@ export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: 
             // Filter out tokens already sent (sent hashes)
             const sent = await readSentHashes(uid);
             const filtered = tokensToSend.filter(t => {
-              const addr = t.tokenAddress || t.address || t.mint || t.pairAddress || '';
+              const addr = t.tokenAddress || t.address || t.mint || '';
               const h = hashTokenAddress(addr);
               return addr && !sent.has(h);
             });
             if (!filtered.length) continue;
 
-            // If ONLY_PRINT_EXPLICIT is enabled, do not send quick DexScreener notifications
-            // from the fast token fetcher. The collector/listener is the authoritative
-            // source for explicit-created tokens and per-user messaging.
-            const onlyExplicit = (process.env.ONLY_PRINT_EXPLICIT === 'true' || process.env.ONLY_PRINT_EXPLICIT === '1');
-            if (onlyExplicit) {
-              // skip sending from fastTokenFetcher in explicit-only mode
+            // Fast path: always skip sending discovery messages from the fast fetcher
+            // when Telegram explicit-only policy is enforced. This constant is hard-
+            // coded to prevent any bypass of the collector/listener for Telegram users.
+            if (TELEGRAM_EXPLICIT_ONLY) {
               continue;
             }
 
             // Send notifications in a batch (one message with multiple tokens or multiple messages)
             // If ONLY_PRINT_EXPLICIT is enabled, skip sending quick notifications from this fast fetcher
             // Only send quick notifications when not in explicit-only mode
-            if (!onlyExplicit) {
-              for (const token of filtered) {
-                const addr = token.mint || token.tokenAddress || token.address || token.pairAddress || '';
-                const h = hashTokenAddress(addr);
-                try {
-                  const msg = `🚀 Token matched: ${token.description || token.name || addr}\nAddress: ${addr}`;
-                  await telegram.sendMessage(uid, msg);
-                  await appendSentHash(uid, h);
-                } catch (e) {
-                  // ignore send errors per token
-                }
+            for (const token of filtered) {
+              const addr = token.mint || token.tokenAddress || token.address || '';
+              const h = hashTokenAddress(addr);
+              try {
+                const msg = `🚀 Token matched: ${token.description || token.name || addr}\nAddress: ${addr}`;
+                await telegram.sendMessage(uid, msg);
+                await appendSentHash(uid, h);
+              } catch (e) {
+                // ignore send errors per token
               }
             }
 
             // Optionally auto-buy for users with autoBuy enabled
             if (u.strategy.autoBuy !== false && Number(u.strategy.buyAmount) > 0) {
                     for (const token of filtered) {
-                const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || '';
+                const addr = token.tokenAddress || token.address || token.mint || '';
                 try {
                   const finalStrategy = normalizeStrategy(u.strategy);
                   const finalOk = await (require('./bot/strategy').filterTokensByStrategy([token], finalStrategy, { preserveSources: true }));
@@ -346,15 +348,16 @@ export function mergeAndCanonicalizeCache(arr: any[]): any[] {
   try {
     const tu = require('./utils/tokenUtils');
     const map: Record<string, any> = {};
-    const fieldsToCoerce = ['marketCap', 'liquidity', 'volume', 'priceUsd', 'ageMinutes', 'ageSeconds'];
-  for (const raw of arr || []) {
+  const fieldsToCoerce = ['marketCap', 'liquidity', 'volume', 'priceUsd', 'ageMinutes', 'ageSeconds'];
+    for (const raw of arr || []) {
       try {
-        const addrRaw = raw && (raw.tokenAddress || raw.address || raw.mint || raw.pairAddress || (raw.token && raw.token.address) || null);
+          const addrRaw = raw && (raw.tokenAddress || raw.address || raw.mint || null);
         const addr = tu.normalizeMintCandidate(addrRaw);
         if (!addr) continue;
         const existing = map[addr] || { tokenAddress: addr, address: addr, mint: addr, sourceTags: [] };
         // merge conservative: prefer existing non-empty values, for numeric fields take max when both present
-        const preferList = ['name','symbol','url','imageUrl','logoURI','pairAddress'];
+  // Do not prefer or copy pairAddress into public entries; canonical on-chain fields only.
+  const preferList = ['name','symbol','url','imageUrl','logoURI'];
         for (const k of preferList) {
           if (!existing[k] && raw[k]) existing[k] = raw[k];
           else if (!existing[k] && raw.token && raw.token[k]) existing[k] = raw.token[k];
@@ -377,7 +380,7 @@ export function mergeAndCanonicalizeCache(arr: any[]): any[] {
             if (existing[k] === undefined || existing[k] === null || existing[k] === '') existing[k] = raw.token[k];
           }
         }
-        // unify sourceTags
+  // unify sourceTags
         existing.sourceTags = Array.isArray(existing.sourceTags) ? existing.sourceTags : (existing.sourceTags ? [existing.sourceTags] : []);
         if (raw.sourceTags) {
           const incoming = Array.isArray(raw.sourceTags) ? raw.sourceTags : [raw.sourceTags];
@@ -633,7 +636,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
         const tu = require('./utils/tokenUtils');
         __global_fetch_cache = (__global_fetch_cache || []).map((t: any) => {
           try {
-            const addr = t.tokenAddress || t.address || t.mint || t.pairAddress || t.token?.address || null;
+            const addr = t.tokenAddress || t.address || t.mint || t.token?.address || null;
             const norm = addr ? tu.normalizeMintCandidate(addr) : null;
             if (norm) { t.tokenAddress = norm; t.address = norm; t.mint = norm; }
             // if candidate was an object with provenance, preserve it
@@ -662,7 +665,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
             const cacheMap: Record<string, any> = {};
             for (const it of __global_fetch_cache || []) {
               try {
-                const rawA = it.tokenAddress || it.address || it.mint || it.pairAddress || null;
+                const rawA = it.tokenAddress || it.address || it.mint || null;
                 const normA = rawA ? tu.normalizeMintCandidate(rawA) : null;
                 if (!normA) continue;
                 // ensure token has canonical address fields
@@ -675,7 +678,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
             }
             for (const d of ds) {
                 try {
-                const addrRaw = d.address || d.tokenAddress || d.pairAddress || d.token?.address || d.token?.tokenAddress || null;
+                const addrRaw = d.address || d.tokenAddress || d.token?.address || d.token?.tokenAddress || null;
                 const addr = tu.normalizeMintCandidate(addrRaw);
                 if (!addr) continue;
                 // prepare canonical ds token object fields
@@ -684,7 +687,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
                 const existing = cacheMap[addr];
                 if (existing) {
                   // list of fields to merge only if missing
-                  const fields = ['marketCap','liquidity','volume','priceUsd','name','symbol','pairAddress','poolOpenTime','poolOpenTimeMs','ageMinutes','ageSeconds','url','imageUrl','logoURI'];
+                  const fields = ['marketCap','liquidity','volume','priceUsd','name','symbol','poolOpenTime','poolOpenTimeMs','ageMinutes','ageSeconds','url','imageUrl','logoURI'];
                   for (const f of fields) {
                     try {
                       const val = dsToken[f] !== undefined ? dsToken[f] : (dsToken.token && dsToken.token[f] !== undefined ? dsToken.token[f] : undefined);
@@ -721,7 +724,9 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
                   newEntry.liquidity = d.liquidity ?? d.liquidityUsd ?? null;
                   newEntry.volume = d.volume ?? d.h24 ?? null;
                   newEntry.priceUsd = d.priceUsd ?? d.price ?? null;
-                  newEntry.pairAddress = d.pairAddress || addr;
+                  // Do not surface pairAddress into newEntry to avoid accidental display.
+                  // Keep canonical addr only.
+                  // newEntry.pairAddress intentionally not set.
                   newEntry.url = d.url || d.pairUrl || d.dexUrl || '';
                   newEntry.imageUrl = d.imageUrl || d.logoURI || '';
                   newEntry.sourceTags = ['dexscreener'];
@@ -811,7 +816,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
             const t = sample[i];
               try {
                 // Gate expensive officialEnrich calls by a lightweight on-chain activity check
-                const addr = t.tokenAddress || t.address || t.mint || t.pairAddress;
+                const addr = t.tokenAddress || t.address || t.mint || '';
                 if (!addr) continue;
                 try {
                   const oc = await checkOnChainActivity(addr);
@@ -865,7 +870,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
       const detailed: any[] = [];
       for (const m of matches) {
         try {
-          const key = String(m.tokenAddress || m.address || m.mint || m.pairAddress || '').toLowerCase();
+          const key = String(m.tokenAddress || m.address || m.mint || '').toLowerCase();
           const canon = key ? tmap[key] : null;
           const merged = Object.assign({}, m);
           if (canon && canon.__sources) merged.__sources = Array.isArray(canon.__sources) ? canon.__sources : [canon.__sources];
@@ -911,7 +916,7 @@ export async function ensureCanonicalOnchainAges(cache: any[], opts?: { timeoutM
           if (!e) continue;
           // skip if canonical age already present (including explicit null)
           if (e._canonicalAgeSeconds !== undefined && e._canonicalAgeSeconds !== null) continue;
-          const addr = e.tokenAddress || e.address || e.mint || e.pairAddress;
+          const addr = e.tokenAddress || e.address || e.mint || undefined;
           if (!addr) { e._canonicalAgeSeconds = e._canonicalAgeSeconds === undefined ? null : e._canonicalAgeSeconds; continue; }
           // Bound the external call by limiter + timeout
           await limiter(async () => {
@@ -955,7 +960,7 @@ export function analyzeFetchSources() {
   const globalSourceSet = new Set<string>();
   for (const it of cache) {
     try {
-      const addr = it.tokenAddress || it.address || it.mint || it.pairAddress || '';
+  const addr = it.tokenAddress || it.address || it.mint || '';
       const srcs = Array.isArray(it.__sources) ? it.__sources : (it.__sources ? [it.__sources] : []);
       // also include sourceTags as string markers
       const tags = Array.isArray(it.sourceTags) ? it.sourceTags : (it.sourceTags ? [it.sourceTags] : []);
@@ -1828,12 +1833,17 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
           const strat = normalizeStrategy(u.strategy);
           const tokenObj = { mint, address: mint, metadataExists, supply, firstBlockTime: detection.firstBlockTime, ageSeconds: detection.ageSeconds, _canonicalAgeSeconds: detection.ageSeconds };
           const matches = await filterTokensByStrategy([tokenObj], strat, { preserveSources: true });
-          if (Array.isArray(matches) && matches.length) {
+                    if (Array.isArray(matches) && matches.length) {
             try {
               const h = hashTokenAddress(mint);
-              const msg = `🚀 New token for you: ${mint}\nAge(s): ${detection.ageSeconds ?? 'N/A'}\nMetadata: ${metadataExists}`;
-              await telegram.sendMessage(uid, msg);
-              await appendSentHash(uid, h);
+              // Do not send discovery messages directly to Telegram when explicit-only
+              // policy is enforced. The collector/listener will perform any user
+              // notifications for explicit-created tokens.
+              if (!TELEGRAM_EXPLICIT_ONLY) {
+                const msg = `🚀 New token for you: ${mint}\nAge(s): ${detection.ageSeconds ?? 'N/A'}\nMetadata: ${metadataExists}`;
+                await telegram.sendMessage(uid, msg);
+                await appendSentHash(uid, h);
+              }
             } catch (e) {}
 
             if (u.strategy.autoBuy !== false && Number(u.strategy.buyAmount) > 0) {

@@ -80,17 +80,19 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
           userTokens = [];
         }
         // Enforce explicit-only regardless of per-user strategy differences.
-        userTokens = (userTokens || []).filter((t: any) => Boolean(t && t.createdHere === true));
-        try {
-          console.log(`[EMIT_DEBUG] user=${userId} collector_tokens=${userTokens.length}`);
-          for (const t of userTokens.slice(0, 20)) {
-            try { const a = t.mint || t.tokenAddress || t.address || t.pairAddress || '<no-addr>'; console.log(`[EMIT_DEBUG_ITEM] user=${userId} addr=${a} createdHere=${String(t.createdHere)} name=${(t.name||t.symbol||'').slice(0,40)}`); } catch(e){}
-          }
-        } catch (e) {}
+        try{
+          const { enforceExplicitTokens } = require('./src/explicit');
+          userTokens = enforceExplicitTokens(userTokens || []);
+        }catch(e){ userTokens = (userTokens || []).filter((t: any) => Boolean(t && t.createdHere === true)); }
+        // Normalize tokens for display and debug-snapshot what we'll send
+        try{
+          const { normalizeTokenForDisplay } = require('./src/utils/tokenUtils');
+          userTokens = userTokens.map((t:any)=> normalizeTokenForDisplay(t));
+        }catch(e){}
         // Exclude tokens already sent to this user
         const sentHashes = await readSentHashes(userId);
         userTokens = userTokens.filter(token => {
-          const addr = token.mint || token.tokenAddress || token.address || token.pairAddress || '';
+          const addr = token.mint || token.tokenAddress || token.address || '';
           const hash = hashTokenAddress(addr);
           return addr && !sentHashes.has(hash);
         });
@@ -101,9 +103,9 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
         const botUsername = bot.botInfo?.username || process.env.BOT_USERNAME || 'YourBotUsername';
         for (const token of limitedTokens) {
           // Wrap the entire per-token processing in a single block so variables remain in scope
-          try {
+            try {
             // Prefer canonical on-chain mint/address fields and avoid pairAddress when possible
-            const addr = token.mint || token.tokenAddress || token.address || token.pairAddress || '';
+            const addr = token.mint || token.tokenAddress || token.address || '';
             const onlyExplicit = (process.env.ONLY_PRINT_EXPLICIT === 'true' || process.env.ONLY_PRINT_EXPLICIT === '1');
             // If explicit-only mode is enabled, skip any token not explicitly created here
             if (onlyExplicit && !(token && token.createdHere === true)) {
@@ -122,7 +124,7 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                 // Final hard-check against normalized strategy before autoBuy
                 const finalStrategy = normalizeStrategy(user.strategy);
                 // If strategy requires Jupiter or pump info, attempt lightweight enrichment for this token
-                const mint = token.tokenAddress || token.address || token.mint || token.pairAddress;
+                const mint = token.tokenAddress || token.address || token.mint;
                 try {
                   const needJupiter = typeof finalStrategy.minJupiterUsd === 'number' || finalStrategy.requireJupiterRoute === true;
                   // pump.fun will be used for enrichment/metadata only; do not require it as a hard filter
@@ -130,7 +132,7 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                   if (needJupiter) {
                     const { JUPITER_QUOTE_API } = await import('./src/config');
                     const { getCoinData } = await import('./src/pump/api');
-                    const mintLocal = token.tokenAddress || token.address || token.mint || token.pairAddress;
+                    const mintLocal = token.tokenAddress || token.address || token.mint;
                     if (needJupiter && JUPITER_QUOTE_API && mintLocal) {
                       try {
                         // default to $50 for quick check if min not set
@@ -183,7 +185,7 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                         pollCount++;
                         // Fetch latest price
                         const freshTokens = await fetchDexScreenerTokens('solana', { limit: '100' });
-                        const fresh = freshTokens.find((t: any) => (t.pairAddress || t.address || t.tokenAddress || '') === addr);
+                        const fresh = freshTokens.find((t: any) => (t.address || t.tokenAddress || t.mint || '') === addr);
                         if (!fresh) continue;
                         const currentPrice = Number(fresh.priceUsd || fresh.price || 0);
                         if (!currentPrice || !buyPrice) continue;
