@@ -42,6 +42,9 @@ export const SCRIPTS_DENY: Set<string> = new Set<string>([
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 ]);
 import { JUPITER_QUOTE_API, HELIUS_RPC_URL, SOLSCAN_API_URL, HELIUS_PARSE_HISTORY_URL, HELIUS_API_KEY, getHeliusApiKey, getSolscanApiKey } from './config';
+import { allowEnrichment } from './utils/collectorGuard';
+// use telegramGuard to ensure explicit-only notifications
+import sendNotificationIfExplicit from './bot/telegramGuard';
 import { getCoinData as getPumpData } from './pump/api';
 import { withTimeout, createLimiter, makeSourceMeta, SourceMeta, getHostLimiter, retryWithBackoff, TTLCache } from './utils/enrichHelpers';
 import { compareSourcesForCache, printEquivalenceReport } from './utils/sourceEquivalence';
@@ -260,8 +263,10 @@ export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: 
               const addr = token.mint || token.tokenAddress || token.address || '';
               const h = hashTokenAddress(addr);
               try {
-                const msg = `🚀 Token matched: ${token.description || token.name || addr}\nAddress: ${addr}`;
-                await telegram.sendMessage(uid, msg);
+                // Use telegramGuard which enforces explicit-only sending and builds safe messages
+                const botHtml = `🚀 Token matched: ${token.description || token.name || addr}\nAddress: ${addr}`;
+                // Provide tokenObjs so the guard can enforce createdHere === true when needed
+                await sendNotificationIfExplicit(telegram, uid, { html: botHtml, tokenObjs: [token], fallbackText: `🚀 Token matched: ${addr}` });
                 await appendSentHash(uid, h);
               } catch (e) {
                 // ignore send errors per token
@@ -286,7 +291,7 @@ export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: 
                     u.history.push(`AutoBuy: ${addr} | ${amount} SOL | Tx: ${resTx} | Fee: ${fee ?? 'N/A'} | Slippage: ${slippage ?? 'N/A'}`);
                     try { saveUsers(users); } catch {}
                     // notify user about executed buy
-                    try { await telegram.sendMessage(uid, `✅ AutoBuy executed for ${addr}\nTx: ${resTx}`); } catch {}
+                    try { await sendNotificationIfExplicit(telegram, uid, { html: `✅ AutoBuy executed for ${addr}\nTx: ${resTx}`, tokenObjs: [{ mint: addr }] }); } catch {}
                     }
                 } catch (e) {
                   // ignore per-token buy errors
@@ -833,6 +838,11 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
                 const limiter = getHostLimiter(host, Number(process.env.FASTFETCH_ENRICH_CONCURRENCY || 1));
                 const startE = Date.now();
                 try {
+                  // Respect collector-only guard: skip heavy officialEnrich unless enabled
+                  try {
+                    const { allowEnrichment } = await import('./utils/collectorGuard');
+                    if (!allowEnrichment()) throw new Error('collector-guard-disabled');
+                  } catch (ee) { throw ee; }
                   await limiter(async () => {
                     const wrap = await withTimeout(officialEnrich(t, { amountUsd: Number(strat.buyAmount) || 50, timeoutMs: 4000 }), 4500);
                     if (!wrap.ok) throw new Error(String((wrap as any).error || 'timeout'));
@@ -1135,6 +1145,12 @@ export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, t
 // Handle a new mint event: attempt quick enrichment (first signature => blockTime) and log
 // --- Helpers: lightweight helius/json-rpc wrapper and verification helpers
 async function heliusRpc(method: string, params: any[] = [], timeout = 4000, retries = 0): Promise<any> {
+  try {
+    // Enforce collector-only policy: avoid making Helius RPC calls from fastTokenFetcher
+    if (!allowEnrichment()) {
+      return { __error: 'collector-guard-disabled' };
+    }
+  } catch (e) {}
   const heliusUrl = HELIUS_RPC_URL || process.env.HELIUS_FAST_RPC_URL;
   if (!heliusUrl) return { __error: 'no-helius-url' };
   // host cooldown guard (global)
@@ -1598,6 +1614,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
   const mint = typeof mintOrObj === 'string' ? mintOrObj : (mintOrObj?.mint || null);
   if (!mint) return null;
   try {
+  try { const t = await import('./utils/trace'); t.traceFlow('fastTokenFetcher:handleNewMintEvent:start',{ mint, payload: typeof mintOrObj === 'string' ? null : (mintOrObj && (mintOrObj.raw ? (mintOrObj.raw.params?.result || mintOrObj.raw.result) : mintOrObj)) }); } catch(e){}
     const heliusUrl = process.env.HELIUS_FAST_RPC_URL || HELIUS_RPC_URL;
     if (!heliusUrl) { console.log('handleNewMintEvent: no helius url'); return null; }
 
@@ -1780,6 +1797,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
     try {
       const chosenReason = metadataTimestampUsed ? 'metadata-pda' : (earliestBlockTime && firstSignature ? 'parsed-mint-or-metadata' : (earliestBlockTime && !firstSignature ? 'min-signature-blocktime' : 'slot-derived'));
       console.log(`[handleNewMintEvent] mint=${mint} selectedReason=${chosenReason} firstSignature=${firstSignature} earliestBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds}`);
+      try { const t = await import('./utils/trace'); t.traceFlow('fastTokenFetcher:handleNewMintEvent:selection', { mint, chosenReason, metadataTimestampUsed: !!metadataTimestampUsed, firstSignature: firstSignature || null, earliestBlockTime: earliestBlockTime || null, ageSeconds: ageSeconds || null }); } catch(e){}
       // Structured log (single-line JSON) to help automated analysis
       try {
         const signatureSummary: any[] = [];
@@ -1826,6 +1844,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
     } catch (e) {}
 
     if (validated && users && telegram) {
+      const { default: sendNotificationIfExplicit } = await import('./bot/telegramGuard');
       for (const uid of Object.keys(users)) {
         try {
           const u = users[uid];
@@ -1841,7 +1860,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
               // notifications for explicit-created tokens.
               if (!TELEGRAM_EXPLICIT_ONLY) {
                 const msg = `🚀 New token for you: ${mint}\nAge(s): ${detection.ageSeconds ?? 'N/A'}\nMetadata: ${metadataExists}`;
-                await telegram.sendMessage(uid, msg);
+                await sendNotificationIfExplicit(telegram, uid, { html: msg, tokenObjs: [tokenObj] });
                 await appendSentHash(uid, h);
               }
             } catch (e) {}
@@ -1857,7 +1876,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
                   const resTx = (result as any)?.tx ?? '';
                   u.history.push(`AutoBuy: ${mint} | ${amount} SOL | Tx: ${resTx} | Fee: ${fee ?? 'N/A'} | Slippage: ${slippage ?? 'N/A'}`);
                   try { saveUsers(users); } catch {}
-                  try { await telegram.sendMessage(uid, `✅ AutoBuy executed for ${mint}\nTx: ${resTx}`); } catch {}
+                  try { await sendNotificationIfExplicit(telegram, uid, { fallbackText: `✅ AutoBuy executed for ${mint}\nTx: ${resTx}`, tokenObjs: [tokenObj] }); } catch {}
                 }
               } catch (e) {}
             }
@@ -1867,8 +1886,14 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
     }
 
     // log and return detection
-    if (validated) console.log(`ValidatedNewMint: ${mint} firstBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds} metadata=${metadataExists} supply=${supply}`);
-    else console.log(`CandidateMint (unvalidated): ${mint} firstBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds} metadata=${metadataExists} supply=${supply}`);
+    if (validated) {
+      // Emit a compact JSON line for tooling and background consumers
+      try { console.log(JSON.stringify({ time: new Date().toISOString(), kind: 'validated', mint, firstBlockTime: earliestBlockTime, ageSeconds, metadataExists, supply })); } catch (e) { console.log(`ValidatedNewMint: ${mint} firstBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds} metadata=${metadataExists} supply=${supply}`); }
+      try { const t = await import('./utils/trace'); t.traceFlow('fastTokenFetcher:handleNewMintEvent:validated',{ mint, firstBlockTime: earliestBlockTime, ageSeconds, metadataExists, supply }); } catch(e){}
+    } else {
+      try { console.log(JSON.stringify({ time: new Date().toISOString(), kind: 'candidate', mint, firstBlockTime: earliestBlockTime, ageSeconds, metadataExists, supply })); } catch (e) { console.log(`CandidateMint (unvalidated): ${mint} firstBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds} metadata=${metadataExists} supply=${supply}`); }
+      try { const t = await import('./utils/trace'); t.traceFlow('fastTokenFetcher:handleNewMintEvent:candidate',{ mint, firstBlockTime: earliestBlockTime, ageSeconds, metadataExists, supply }); } catch(e){}
+    }
     // mark Redis seen flag for short-term dedupe to avoid re-notifying rapidly
     try {
       const rc = await getRedisClient().catch(() => null);
@@ -1921,6 +1946,8 @@ export async function handleNewMintEventCached(mintOrObj: any, ttlSec?: number) 
   try { cached = (typeof _hh_cache.get === 'function') ? _hh_cache.get(key) : _hh_cache.get(key); } catch (e) { cached = null; }
   if (cached && (now - (cached.ts || 0) <= ttl)) return cached.res;
 
+  try { const t = await import('./utils/trace'); t.traceFlow('fastTokenFetcher:handleNewMintEventCached:cache_miss',{ mint, key, ttl }); } catch(e){}
+
     // If there's an in-flight request, reuse it
     const inflight = _hh_inflight.get(key);
     if (inflight) return inflight;
@@ -1960,8 +1987,9 @@ export async function handleNewMintEventCached(mintOrObj: any, ttlSec?: number) 
       }
     });
 
-    try { _hh_inflight.set(key, promise); } catch (e) {}
-    return promise;
+  try { _hh_inflight.set(key, promise); } catch (e) {}
+  try { const t = await import('./utils/trace'); t.traceFlow('fastTokenFetcher:handleNewMintEventCached:inflight_set',{ mint, key }); } catch(e){}
+  return promise;
   } catch (e) { return null; }
 }
 
@@ -2399,9 +2427,17 @@ export async function testFetchEnrichFilterLatest() {
     let hf: any = null;
     try { const ff = require('./fastTokenFetcher'); hf = ff && (ff.handleNewMintEvent || ff.default && ff.default.handleNewMintEvent); } catch(e) {}
     if (!hf) {
-      // fallback: use enrichTokenTimestamps on single token objects
+      // fallback: use enrichTokenTimestamps on single token objects (guarded)
       const { enrichTokenTimestamps } = require('./utils/tokenUtils');
-      hf = async (evt: any) => { const addr = evt && (evt.mint || evt.address); const token = { tokenAddress: addr }; await enrichTokenTimestamps([token], { batchSize: 1, delayMs: 0 }); return token; };
+      const { allowEnrichment } = require('./utils/collectorGuard');
+      hf = async (evt: any) => {
+        const addr = evt && (evt.mint || evt.address);
+        const token = { tokenAddress: addr };
+        try {
+          if (allowEnrichment()) await enrichTokenTimestamps([token], { batchSize: 1, delayMs: 0 });
+        } catch (e) {}
+        return token;
+      };
     }
 
     // 3) enqueue enrich jobs and wait for them

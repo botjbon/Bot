@@ -180,16 +180,8 @@ export const withdrawButtonHandler = async (
     const user = await UserService.findOne({ username });
     if (!user) return;
 
-    const sentMessage = await bot.sendMessage(
-      chat_id,
-      WITHDRAW_TOKEN_AMT_TEXT,
-      {
-        parse_mode: "HTML",
-        reply_markup: {
-          force_reply: true,
-        },
-      }
-    );
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, WITHDRAW_TOKEN_AMT_TEXT, { parse_mode: "HTML", reply_markup: { force_reply: true } });
 
     await MsgLogService.create({
       username,
@@ -217,11 +209,8 @@ export const withdrawAddressHandler = async (
   if (!user) return;
 
   if (!isValidWalletAddress(receive_address)) {
-    bot.sendMessage(
-      chat_id,
-      `<b>Invalid wallet address. Please try it again.</b>`,
-      closeReplyMarkup
-    );
+    const { sendMessageFiltered } = await import('../bot/screenGuard');
+    await sendMessageFiltered(bot.telegram, chat_id, `<b>Invalid wallet address. Please try it again.</b>`, closeReplyMarkup);
     return;
   }
 
@@ -255,48 +244,8 @@ export const withdrawAddressHandler = async (
     `Balance: ${balance}\n\n` +
     `<b>Receive wallet:</b> ${copytoclipboard(receive_address)}`;
 
-  const sentMessage = await bot.sendMessage(chat_id, caption, {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "Withdraw 10%",
-            callback_data: JSON.stringify({
-              command: "withdraw_10",
-            }),
-          },
-          {
-            text: "Withdraw 50%",
-            callback_data: JSON.stringify({
-              command: "withdraw_50",
-            }),
-          },
-          {
-            text: "Withdraw 100%",
-            callback_data: JSON.stringify({
-              command: "withdraw_100",
-            }),
-          },
-        ],
-        [
-          {
-            text: "Withdraw X",
-            callback_data: JSON.stringify({
-              command: "withdrawtoken_custom",
-            }),
-          },
-          {
-            text: "❌ Cancel",
-            callback_data: JSON.stringify({
-              command: "cancel_withdraw",
-            }),
-          },
-        ],
-      ],
-    },
-  });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, caption, { parse_mode: "HTML", disable_web_page_preview: true, reply_markup: { inline_keyboard: [ [ { text: "Withdraw 10%", callback_data: JSON.stringify({ command: "withdraw_10", }), }, { text: "Withdraw 50%", callback_data: JSON.stringify({ command: "withdraw_50", }), }, { text: "Withdraw 100%", callback_data: JSON.stringify({ command: "withdraw_100", }), }, ], [ { text: "Withdraw X", callback_data: JSON.stringify({ command: "withdrawtoken_custom", }), }, { text: "❌ Cancel", callback_data: JSON.stringify({ command: "cancel_withdraw", }), }, ], ], }, });
 
   await MsgLogService.create({
     chat_id,
@@ -326,11 +275,8 @@ export const withdrawHandler = async (
   const regex = /^[0-9]+(\.[0-9]+)?$/;
   const isNumber = regex.test(percentstr) === true;
   if (!isNumber) {
-    bot.sendMessage(
-      chat_id,
-      `<b>Invalid number for amount. Please try it again.</b>`,
-      closeReplyMarkup
-    );
+    const { sendMessageFiltered } = await import('../bot/screenGuard');
+    await sendMessageFiltered(bot.telegram, chat_id, `<b>Invalid number for amount. Please try it again.</b>`, closeReplyMarkup);
     return;
   }
   const percent = Number(percentstr);
@@ -383,10 +329,14 @@ export const withdrawHandler = async (
     return securecaption;
   };
 
-  const buycaption = await getcaption(`🕒 <b>Withdraw in progress</b>\n`);
-  const pendingMessage = await bot.sendMessage(chat_id, buycaption, {
-    parse_mode: "HTML",
-  });
+    const buycaption = await getcaption(`🕒 <b>Withdraw in progress</b>\n`);
+    const { sendMessageFiltered } = await import('../bot/screenGuard');
+    let pendingMessage: any = null;
+    try {
+      pendingMessage = await sendMessageFiltered(bot.telegram, chat_id, buycaption, { parse_mode: "HTML" });
+    } catch (e) {
+      console.error("Failed to send pending message", e);
+    }
 
   const jupiterSerivce = new JupiterService();
   const transferResult =
@@ -423,14 +373,16 @@ export const withdrawHandler = async (
       reply_markup: closeReplyMarkup.reply_markup as InlineKeyboardMarkup,
     });
   } else {
-    const failedCaption = await getcaption(`🔴 <b>Withdraw Failed</b>\n`);
-    bot.editMessageText(failedCaption, {
-      message_id: pendingMessage.message_id,
-      chat_id,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: closeReplyMarkup.reply_markup as InlineKeyboardMarkup,
-    });
+      const failedCaption = await getcaption(`🔴 <b>Withdraw Failed</b>\n`);
+      try {
+        await bot.editMessageText(failedCaption, {
+          message_id: (pendingMessage as any)?.message_id,
+          chat_id,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+          reply_markup: closeReplyMarkup.reply_markup as InlineKeyboardMarkup,
+        });
+      } catch (e) {}
   }
 };
 
@@ -453,12 +405,8 @@ export const withdrawCustomAmountScreenHandler = async (
     const { mint } = msglog;
     if (!mint) return;
 
-    const sentMessage = await bot.sendMessage(chat_id, WITHDRAW_XTOKEN_TEXT, {
-      parse_mode: "HTML",
-      reply_markup: {
-        force_reply: true,
-      },
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, WITHDRAW_XTOKEN_TEXT, { parse_mode: "HTML", reply_markup: { force_reply: true } });
 
     await MsgLogService.create({
       username,

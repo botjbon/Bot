@@ -46,6 +46,9 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
         return notScam;
       });
 
+  // Load telegram guard to enforce explicit-only notifications
+  const { default: sendNotificationIfExplicit } = await import('./src/bot/telegramGuard');
+
       // Import required functions
   const { buildTokenMessage } = await import('./src/utils/tokenUtils');
   const { filterTokensByStrategy } = await import('./src/bot/strategy');
@@ -158,7 +161,7 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                     const buyAmt = Number(user.strategy.buyAmount) || 0.01;
                     const jres = await finalJupiterCheck(mint, buyAmt, { minJupiterUsd: finalStrategy.minJupiterUsd, requireRoute: finalStrategy.requireJupiterRoute, timeoutMs: 3000 });
                     if (!jres.ok) {
-                      await bot.telegram.sendMessage(userId, `⚠️ Skipped AutoBuy for ${mint}: Jupiter check failed (${jres.reason})`, { parse_mode: 'HTML' });
+            await sendNotificationIfExplicit(bot, userId, { fallbackText: `⚠️ Skipped AutoBuy for ${mint}: Jupiter check failed (${jres.reason})` });
                     } else {
                       const result = await unifiedBuy(addr, buyAmount, user.secret);
                       const { fee, slippage } = extractTradeMeta(result, 'buy');
@@ -171,7 +174,7 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                       if (resTx) buyMsg += `\n<a href='https://solscan.io/tx/${resTx}'>View Tx</a>`;
                       if (fee != null) buyMsg += `\nFee: <b>${fee}</b>`;
                       if (slippage != null) buyMsg += `\nSlippage: <b>${slippage}</b>`;
-                      await bot.telegram.sendMessage(userId, buyMsg, { parse_mode: 'HTML', disable_web_page_preview: false });
+            await sendNotificationIfExplicit(bot, userId, { html: buyMsg, tokenObjs: [token] });
 
                       // --- AUTO-SELL/STOP-LOSS LOGIC ---
                       const buyPrice = Number(token.priceUsd || token.price || 0);
@@ -203,11 +206,11 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                             if (sellTx) sellMsg += `\n<a href='https://solscan.io/tx/${sellTx}'>View Tx</a>`;
                             if (sellFee != null) sellMsg += `\nFee: <b>${sellFee}</b>`;
                             if (sellSlippage != null) sellMsg += `\nSlippage: <b>${sellSlippage}</b>`;
-                            await bot.telegram.sendMessage(userId, sellMsg, { parse_mode: 'HTML', disable_web_page_preview: false });
+              await sendNotificationIfExplicit(bot, userId, { html: sellMsg, tokenObjs: [token] });
                             sold = true;
                             break;
                           } catch (err) {
-                            await bot.telegram.sendMessage(userId, `❌ <b>AutoSell Failed</b>\nToken: <code>${addr}</code>\nError: ${(err as Error).message || err}`, { parse_mode: 'HTML' });
+              await sendNotificationIfExplicit(bot, userId, { fallbackText: `❌ <b>AutoSell Failed</b>\nToken: <code>${addr}</code>\nError: ${(err as Error).message || err}` });
                           }
                         }
                         // Check stop loss
@@ -223,11 +226,11 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                             if (sellTx) sellMsg += `\n<a href='https://solscan.io/tx/${sellTx}'>View Tx</a>`;
                             if (sellFee != null) sellMsg += `\nFee: <b>${sellFee}</b>`;
                             if (sellSlippage != null) sellMsg += `\nSlippage: <b>${sellSlippage}</b>`;
-                            await bot.telegram.sendMessage(userId, sellMsg, { parse_mode: 'HTML', disable_web_page_preview: false });
+              await sendNotificationIfExplicit(bot, userId, { html: sellMsg, tokenObjs: [token] });
                             sold = true;
                             break;
                           } catch (err) {
-                            await bot.telegram.sendMessage(userId, `❌ <b>AutoSell (Stop Loss) Failed</b>\nToken: <code>${addr}</code>\nError: ${(err as Error).message || err}`, { parse_mode: 'HTML' });
+              await sendNotificationIfExplicit(bot, userId, { fallbackText: `❌ AutoSell (Stop Loss) Failed for ${addr}` });
                           }
                         }
                       }
@@ -236,16 +239,12 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                 }
               }
             } catch (err) {
-              await bot.telegram.sendMessage(userId, `❌ <b>AutoBuy Failed</b>\nToken: <code>${addr}</code>\nError: ${(err as Error).message || err}`, { parse_mode: 'HTML' });
+        await sendNotificationIfExplicit(bot, userId, { fallbackText: `❌ <b>AutoBuy Failed</b>\nToken: <code>${addr}</code>\nError: ${(err as Error).message || err}` });
             }
             // --- END AUTO-BUY/SELL/STOP-LOSS LOGIC ---
             if (msg && typeof msg === 'string') {
-              try {
-                await bot.telegram.sendMessage(userId, msg, {
-                  parse_mode: 'HTML',
-                  disable_web_page_preview: false,
-                  reply_markup: { inline_keyboard: inlineKeyboard }
-                });
+                try {
+                await sendNotificationIfExplicit(bot, userId, { html: msg, tokenObjs: [token], inlineKeyboard });
                 await appendSentHash(userId, hash);
               } catch (err) {
                 console.error(`Failed to send message to user ${userId}:`, err);

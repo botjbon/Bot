@@ -96,9 +96,8 @@ export const setSOLPayoutAddressHandler = async (
 ) => {
   try {
     if (!chat.username) return;
-    const solAddressMsg = await bot.sendMessage(chat.id, INPUT_SOL_ADDRESS, {
-      parse_mode: "HTML",
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const solAddressMsg = await sendMessageFiltered(bot.telegram, chat.id, INPUT_SOL_ADDRESS, { parse_mode: "HTML" });
   const textEventHandler = async (msg: TelegramMessage) => {
       const receivedChatId = msg.chat.id;
       const receivedText = msg.text;
@@ -140,11 +139,9 @@ const updateSOLaddressForPayout = async (
     const chatId = chat.id;
     // validate first
     if (!isValidWalletAddress(address)) {
-      bot.deleteMessage(chatId, old_message_id);
-      const message = await bot.sendMessage(
-        chatId,
-        "Invalid wallet address. Try it again"
-      );
+  bot.deleteMessage(chatId, old_message_id);
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const message = await sendMessageFiltered(bot.telegram, chatId, "Invalid wallet address. Try it again");
       setTimeout(() => {
         bot.deleteMessage(chatId, message.message_id);
       }, 3000);
@@ -166,7 +163,8 @@ const updateSOLaddressForPayout = async (
     //     address,
     // )
     if (true) {
-      const sentMsg = await bot.sendMessage(chatId, "Successfully updated!");
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMsg = await sendMessageFiltered(bot.telegram, chatId, "Successfully updated!");
       setTimeout(() => {
         bot.deleteMessage(chatId, sentMsg.message_id);
         bot.deleteMessage(chatId, old_message_id + 1);

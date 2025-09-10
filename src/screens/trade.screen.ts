@@ -104,12 +104,8 @@ export const buyCustomAmountScreenHandler = async (
     const { mint } = msglog;
     if (!mint) return;
 
-    const sentMessage = await bot.sendMessage(chat_id, BUY_XSOL_TEXT, {
-      parse_mode: "HTML",
-      reply_markup: {
-        force_reply: true,
-      },
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, BUY_XSOL_TEXT, { parse_mode: "HTML", reply_markup: { force_reply: true } });
 
     await MsgLogService.create({
       username,
@@ -138,12 +134,8 @@ export const sellCustomAmountScreenHandler = async (
     const mint = getTokenMintFromCallback(caption);
     if (!mint) return;
 
-    const sentMessage = await bot.sendMessage(chat_id, SELL_XPRO_TEXT, {
-      parse_mode: "HTML",
-      reply_markup: {
-        force_reply: true,
-      },
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, SELL_XPRO_TEXT, { parse_mode: "HTML", reply_markup: { force_reply: true } });
 
     await MsgLogService.create({
       username,
@@ -178,12 +170,8 @@ export const setSlippageScreenHandler = async (
 
     // if (!mint) return;
 
-    const sentMessage = await bot.sendMessage(chat_id, SET_SLIPPAGE_TEXT, {
-      parse_mode: "HTML",
-      reply_markup: {
-        force_reply: true,
-      },
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, SET_SLIPPAGE_TEXT, { parse_mode: "HTML", reply_markup: { force_reply: true } });
 
     await MsgLogService.create({
       username,
@@ -328,10 +316,9 @@ export const buyHandler = async (
   };
   const buycaption = getcaption(`🕒 <b>Buy in progress</b>\n`);
 
-  const pendingTxMsg = await bot.sendMessage(chat_id, buycaption, {
-    parse_mode: "HTML",
-  });
-  const pendingTxMsgId = pendingTxMsg.message_id;
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const pendingTxMsg = await sendMessageFiltered(bot.telegram, chat_id, buycaption, { parse_mode: "HTML" });
+  const pendingTxMsgId = (pendingTxMsg as any)?.message_id;
   console.log("Buy3:", Date.now());
 
   const { slippage } = await UserTradeSettingService.getSlippage(
@@ -410,7 +397,7 @@ export const buyHandler = async (
       // Update Referral System
       await checkReferralFeeSent(total_fee_in_sol, username);
     } else {
-      await bot.deleteMessage(chat_id, pendingTxMsgId);
+    try { await bot.deleteMessage(chat_id, pendingTxMsgId); } catch (e) {}
       resultCaption = getcaption(`🔴 <b>Buy Failed</b>\n`, suffix);
     }
     await bot.editMessageText(resultCaption, {
@@ -552,10 +539,9 @@ export const autoBuyHandler = async (
   };
   const buycaption = getcaption(`🕒 <b>Buy in progress</b>\n`);
 
-  const pendingTxMsg = await bot.sendMessage(chat_id, buycaption, {
-    parse_mode: "HTML",
-  });
-  const pendingTxMsgId = pendingTxMsg.message_id;
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const pendingTxMsg = await sendMessageFiltered(bot.telegram, chat_id, buycaption, { parse_mode: "HTML" });
+  const pendingTxMsgId = (pendingTxMsg as any)?.message_id;
   console.log("Buy start:", Date.now());
 
   // buy token
@@ -786,9 +772,8 @@ export const sellHandler = async (
   };
 
   const buycaption = getcaption(`🕒 <b>Sell in progress</b>\n`);
-  const pendingMessage = await bot.sendMessage(chat_id, buycaption, {
-    parse_mode: "HTML",
-  });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const pendingMessage = await sendMessageFiltered(bot.telegram, chat_id, buycaption, { parse_mode: "HTML" });
 
   // sell token
   const { slippage } = await UserTradeSettingService.getSlippage(

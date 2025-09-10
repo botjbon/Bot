@@ -15,8 +15,13 @@ const HELIUS_RPC_URLS = (process.env.HELIUS_RPC_URLS || process.env.HELIUS_RPC_U
 if(_HELIUS_KEYS.length===0){ const k = process.env.HELIUS_API_KEY || ''; if(k) _HELIUS_KEYS.push(k); }
 if(HELIUS_RPC_URLS.length===0){ HELIUS_RPC_URLS.push('https://mainnet.helius-rpc.com/'); }
 let heliusCallCounter = 0;
+// Collector guard: only allow active enrichment/RPCs when FORCE_ENRICH=true
+const ALLOW_ENRICH = String(process.env.FORCE_ENRICH || '').toLowerCase() === 'true';
+if(!ALLOW_ENRICH){ console.error('[COLLECTOR-GUARD] enrich_worker: Helius RPCs disabled (FORCE_ENRICH not set). To enable set FORCE_ENRICH=true in the environment.'); }
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 async function heliusRpc(method, params){
+  // Respect collector-only policy: if enrichment is not allowed, return a sentinel error
+  if(!ALLOW_ENRICH){ return { __error: 'collector-guard-disabled' }; }
   try{
     const keyIdx = heliusCallCounter % Math.max(1, _HELIUS_KEYS.length);
     const urlIdx = heliusCallCounter % Math.max(1, HELIUS_RPC_URLS.length);

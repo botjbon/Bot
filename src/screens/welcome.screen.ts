@@ -63,10 +63,8 @@ export const welcomeScreenHandler = async (
     const { username, id: chat_id, first_name, last_name } = msg.chat;
     // check if bot
     if (!username) {
-      bot.sendMessage(
-        chat_id,
-        "⚠️ You have no telegram username. Please take at least one and try it again."
-      );
+      const { sendMessageFiltered } = await import('../bot/screenGuard');
+      await sendMessageFiltered(bot.telegram, chat_id, "⚠️ You have no telegram username. Please take at least one and try it again.");
       return;
     }
     const user = await UserService.findOne({ username });
@@ -116,10 +114,8 @@ const newUserHandler = async (bot: TelegramBotType, msg: TelegramMessage) => {
 
   // impossible to create
   if (!userdata) {
-    await bot.sendMessage(
-      chat_id,
-      "Sorry, we cannot create your account. Please contact support team"
-    );
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  await sendMessageFiltered(bot.telegram, chat_id, "Sorry, we cannot create your account. Please contact support team");
     return false;
   }
 
@@ -132,7 +128,10 @@ const newUserHandler = async (bot: TelegramBotType, msg: TelegramMessage) => {
     `<tg-spoiler>${private_key}</tg-spoiler>\n\n` +
     `<b>To get started, please read our <a href="https://docs.growsol.io">docs</a></b>`;
 
-  await bot.sendMessage(chat_id, caption, {
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  // For security, do not include private key in a chat message. Only show a safe confirmation.
+  const safeCaption = `👋 Welcome! A wallet was generated for you. For security, the private key is not shown in chat. Use the app features or /restore_wallet to manage your wallet.`;
+  await sendMessageFiltered(bot.telegram, chat_id, safeCaption, {
     parse_mode: "HTML",
     disable_web_page_preview: true,
     reply_markup: {
@@ -224,19 +223,10 @@ export const welcomeGuideHandler = async (
     ),
   };
 
-  if (replaceId) {
-    bot.editMessageText(caption, {
-      message_id: replaceId,
-      chat_id,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup,
-    });
-  } else {
-    await bot.sendMessage(chat_id, caption, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup,
-    });
-  }
+    if (replaceId) {
+      try { await bot.editMessageText(caption, { message_id: replaceId, chat_id, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup }); } catch(e){}
+    } else {
+      const { sendMessageFiltered } = await import('../bot/screenGuard');
+      await sendMessageFiltered(bot.telegram, chat_id, caption, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup });
+    }
 };

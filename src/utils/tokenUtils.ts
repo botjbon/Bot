@@ -85,6 +85,8 @@ try {
 } catch (e) {}
 import axios from 'axios';
 import { enforceExplicitTokens, isExplicitOnly } from '../explicit';
+// Use telegramGuard to ensure only explicit tokens are sent to users
+import sendNotificationIfExplicit from '../bot/telegramGuard';
 import { Connection, PublicKey } from '@solana/web3.js';
 import fs from 'fs';
 import path from 'path';
@@ -116,6 +118,7 @@ import {
   FRESHNESS_SCORE_TIMEOUT_MS,
 } from '../config';
 import { getSolscanApiKey, getJupiterApiKey } from '../config';
+import { allowEnrichment } from './collectorGuard';
 
 // Mirror listener-only guard used elsewhere: when true, avoid making outbound HTTP/RPC calls
 const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
@@ -1014,6 +1017,13 @@ export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: 
   const batchSize = opts?.batchSize ?? Number(HELIUS_BATCH_SIZE || 4);
   const delayMs = opts?.delayMs ?? Number(HELIUS_BATCH_DELAY_MS || 400);
   const enrichLimit = Number(HELIUS_ENRICH_LIMIT || 8);
+  // Enforce collector-only policy: skip heavy enrichment unless operator enables it
+  try {
+    if (!allowEnrichment()) {
+      console.log('[ENRICH] enrichTokenTimestamps skipped due to collectorGuard (FORCE_ENRICH not set)');
+      return;
+    }
+  } catch (e) {}
   // Build canonical address -> token map
   const addrMap = new Map<string, any>();
   for (const t of tokens) {
@@ -1090,6 +1100,16 @@ export function getEnrichmentMetrics() {
  */
 export async function officialEnrich(token: any, opts?: { amountUsd?: number; timeoutMs?: number }) {
   if (!token) return null;
+  // If collector-only policy is active, avoid enqueueing heavy on-chain enrichment here.
+  try {
+    if (!allowEnrichment()) {
+      try { token.jupiter = null; } catch (e) {}
+      try { token.jupiterCheck = { ok: true, reason: 'collector-guard-disabled' }; } catch (e) {}
+      try { await computeFreshnessScore(token); } catch (e) {}
+      return token;
+    }
+  } catch (e) {}
+
   return onchainLimiter.enqueue(async () => {
     try {
       // Ensure token has canonical address
@@ -1505,15 +1525,15 @@ export async function notifyUsers(bot: any, users: Record<string, any>, tokens: 
     const pairAddress = address; // pass canonical id as pairAddress param but do not use token.pairAddress
     const singleMsg = buildTokenMessage(token, botUsername, pairAddress);
         if (typeof singleMsg.msg !== 'string') {
-          await bot.telegram.sendMessage(uid, '⚠️ We are still looking for the gems you want.');
+          await sendNotificationIfExplicit(bot, uid, { fallbackText: '⚠️ We are still looking for the gems you want.' });
         } else {
-          await bot.telegram.sendMessage(uid, singleMsg.msg, ({ parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard: singleMsg.inlineKeyboard } } as any));
+          await sendNotificationIfExplicit(bot, uid, { html: singleMsg.msg, inlineKeyboard: singleMsg.inlineKeyboard, tokenObjs: [token] });
         }
       } else {
         // Multiple tokens: send a single bulleted message with inline buttons
         try {
           const { text, inline_keyboard } = buildBulletedMessage(solFiltered, { cluster: process.env.SOLANA_CLUSTER, title: 'Tokens matching your strategy', maxShow: solFiltered.length });
-          await bot.telegram.sendMessage(uid, text, ({ parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard } } as any));
+          await sendNotificationIfExplicit(bot, uid, { html: text, inlineKeyboard: inline_keyboard, tokenObjs: solFiltered.slice(0, Math.min(solFiltered.length, 5)) });
         } catch (e) {
           // fallback: send individual messages
           for (const token of solFiltered) {
@@ -1522,17 +1542,13 @@ export async function notifyUsers(bot: any, users: Record<string, any>, tokens: 
               const address = token.tokenAddress || token.address || token.mint || 'N/A';
               const pairAddress = address;
               const singleMsg = buildTokenMessage(token, botUsername, pairAddress);
-              if (typeof singleMsg.msg === 'string') await bot.telegram.sendMessage(uid, singleMsg.msg, ({ parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard: singleMsg.inlineKeyboard } } as any));
+              if (typeof singleMsg.msg === 'string') await sendNotificationIfExplicit(bot, uid, { html: singleMsg.msg, inlineKeyboard: singleMsg.inlineKeyboard, tokenObjs: [token] });
             } catch (e2) {}
           }
         }
       }
     } else if (bot) {
-              await bot.telegram.sendMessage(
-                uid,
-                'No tokens currently match your strategy.\n\nYour strategy filters may be too strict for the available data from DexScreener.\n\nTry lowering requirements like liquidity, market cap, volume, age, or holders, then try again.',
-          ({ parse_mode: 'HTML', disable_web_page_preview: true } as any)
-              );
+              await sendNotificationIfExplicit(bot, uid, { fallbackText: 'No tokens currently match your strategy.\n\nYour strategy filters may be too strict for the available data. Try lowering requirements like liquidity, market cap, volume, age, or holders, then try again.' });
     }
   }
 }

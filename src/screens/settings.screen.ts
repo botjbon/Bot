@@ -163,12 +163,9 @@ export const settingScreenHandler = async (
       });
       sentMessageId = replaceId;
     } else {
-      const sentMessage = await bot.sendMessage(chat_id, caption, {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup,
-      });
-      sentMessageId = sentMessage.message_id;
+      const { sendMessageFiltered } = await import('../bot/screenGuard');
+      const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, caption, { parse_mode: "HTML", disable_web_page_preview: true, reply_markup });
+      sentMessageId = (sentMessage as any)?.message_id ?? 0;
     }
 
     await MsgLogService.create({
@@ -208,50 +205,8 @@ export const presetBuyBtnHandler = async (
   const caption =
     `⚙ Manual Buy Amount Presets\n\n` +
     `💡 <i>Click on the button that you would like to change the value of</i>`;
-  const sentMessage = await bot.sendMessage(chat_id, caption, {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: `Buy ${preset_setting[0]} SOL`,
-            callback_data: JSON.stringify({
-              command: `preset_buy_0`,
-            }),
-          },
-          {
-            text: `Buy ${preset_setting[1]} SOL`,
-            callback_data: JSON.stringify({
-              command: `preset_buy_1`,
-            }),
-          },
-        ],
-        [
-          {
-            text: `Buy ${preset_setting[2]} SOL`,
-            callback_data: JSON.stringify({
-              command: `preset_buy_2`,
-            }),
-          },
-          {
-            text: `Buy ${preset_setting[3]} SOL`,
-            callback_data: JSON.stringify({
-              command: `preset_buy_3`,
-            }),
-          },
-        ],
-        [
-          {
-            text: `❌ Dismiss message`,
-            callback_data: JSON.stringify({
-              command: "dismiss_message",
-            }),
-          },
-        ],
-      ],
-    },
-  });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, caption, { parse_mode: "HTML", disable_web_page_preview: true, reply_markup: { inline_keyboard: [ [ { text: `Buy ${preset_setting[0]} SOL`, callback_data: JSON.stringify({ command: `preset_buy_0`, }), }, { text: `Buy ${preset_setting[1]} SOL`, callback_data: JSON.stringify({ command: `preset_buy_1`, }), }, ], [ { text: `Buy ${preset_setting[2]} SOL`, callback_data: JSON.stringify({ command: `preset_buy_2`, }), }, { text: `Buy ${preset_setting[3]} SOL`, callback_data: JSON.stringify({ command: `preset_buy_3`, }), }, ], [ { text: `❌ Dismiss message`, callback_data: JSON.stringify({ command: "dismiss_message" }), }, ], ], } });
 };
 
 export const autoBuyAmountScreenHandler = async (
@@ -269,12 +224,8 @@ export const autoBuyAmountScreenHandler = async (
     const key = "autobuy_amount" + username;
     await redisClient.set(key, replaceId);
 
-    const sentMessage = await bot.sendMessage(chat_id, AUTO_BUY_TEXT, {
-      parse_mode: "HTML",
-      reply_markup: {
-        force_reply: true,
-      },
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, AUTO_BUY_TEXT, { parse_mode: "HTML", reply_markup: { force_reply: true } });
   } catch (e) {
     console.log("~buyCustomAmountScreenHandler~", e);
   }
@@ -294,12 +245,8 @@ export const presetBuyAmountScreenHandler = async (
 
     let key = "preset_index" + username;
     await redisClient.set(key, preset_index);
-    const sentMessage = await bot.sendMessage(chat_id, PRESET_BUY_TEXT, {
-      parse_mode: "HTML",
-      reply_markup: {
-        force_reply: true,
-      },
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, PRESET_BUY_TEXT, { parse_mode: "HTML", reply_markup: { force_reply: true } });
   } catch (e) {
     console.log("~buyCustomAmountScreenHandler~", e);
   }
@@ -406,10 +353,9 @@ export const generateNewWalletHandler = async (
       const limitcaption =
         `<b>You have generated too many wallets. Max limit: ${MAX_WALLET}.</b>\n` +
         `<i>If you need any help, please contact support team.</i>`;
-      const sentmsg = await bot.sendMessage(chat_id, limitcaption, {
-        parse_mode: "HTML",
-      });
-      deleteDelayMessage(bot, chat_id, sentmsg.message_id, 10000);
+      const { sendMessageFiltered } = await import('../bot/screenGuard');
+      const sentmsg = await sendMessageFiltered(bot.telegram, chat_id, limitcaption, { parse_mode: "HTML" });
+      deleteDelayMessage(bot, chat_id, (sentmsg as any)?.message_id, 10000);
       return;
     }
 
@@ -471,10 +417,8 @@ export const generateNewWalletHandler = async (
 
     // impossible to create
     if (!userdata) {
-      await bot.sendMessage(
-        chat_id,
-        "Sorry, we cannot create your account. Please contact support team"
-      );
+      const { sendMessageFiltered } = await import('../bot/screenGuard');
+      await sendMessageFiltered(bot.telegram, chat_id, "Sorry, we cannot create your account. Please contact support team");
       return;
     }
     // send private key & wallet address
@@ -485,22 +429,8 @@ export const generateNewWalletHandler = async (
       `<b>Save this private key below</b>❗\n\n` +
       `<tg-spoiler>${private_key}</tg-spoiler>\n\n`;
 
-    await bot.sendMessage(chat_id, caption, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "❌ Dismiss message",
-              callback_data: JSON.stringify({
-                command: "dismiss_message",
-              }),
-            },
-          ],
-        ],
-      },
-    });
+    const { sendMessageFiltered } = await import('../bot/screenGuard');
+    await sendMessageFiltered(bot.telegram, chat_id, caption, { parse_mode: "HTML", disable_web_page_preview: true, reply_markup: { inline_keyboard: [ [ { text: "❌ Dismiss message", callback_data: JSON.stringify({ command: "dismiss_message" }), }, ], ], }, });
     settingScreenHandler(bot, msg, msg.message_id);
   } catch (e) {
     console.log("~generateNewWalletHandler~", e);
@@ -528,22 +458,8 @@ export const revealWalletPrivatekyHandler = async (
       `🗝 <b>Your private key</b>\n` +
       `<tg-spoiler>${user.private_key}</tg-spoiler>\n\n`;
 
-    await bot.sendMessage(chat_id, caption, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "❌ Dismiss message",
-              callback_data: JSON.stringify({
-                command: "dismiss_message",
-              }),
-            },
-          ],
-        ],
-      },
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  await sendMessageFiltered(bot.telegram, chat_id, caption, { parse_mode: "HTML", disable_web_page_preview: true, reply_markup: { inline_keyboard: [ [ { text: "❌ Dismiss message", callback_data: JSON.stringify({ command: "dismiss_message" }), }, ], ], }, });
     // settingScreenHandler(bot, msg, msg.message_id);
   } catch (e) {
     console.log("~revealWalletPrivatekyHandler~", e);
@@ -569,8 +485,9 @@ export const switchWalletHandler = async (
     );
     await UserService.findAndUpdateOne({ username, nonce }, { retired: false });
 
-    const sentmsg = await bot.sendMessage(chat.id, "Successfully updated");
-    deleteDelayMessage(bot, chat.id, sentmsg.message_id, 5000);
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentmsg = await sendMessageFiltered(bot.telegram, chat.id, "Successfully updated");
+  deleteDelayMessage(bot, chat.id, (sentmsg as any)?.message_id, 5000);
     settingScreenHandler(bot, msg, msg.message_id);
   } catch (e) {
     console.log("~switchWalletHandler~", e);
@@ -585,6 +502,7 @@ export const setCustomBuyPresetHandler = async (
 ) => {
   try {
     const { id: chat_id, username } = msg.chat;
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
     if (!username) {
       await sendUsernameRequiredNotification(bot, msg);
       return;
@@ -599,13 +517,10 @@ export const setCustomBuyPresetHandler = async (
       { username },
       { preset_setting: presetSetting }
     );
-    const sentSuccessMsg = await bot.sendMessage(
-      chat_id,
-      "Preset value changed successfully!"
-    );
+    const sentSuccessMsg = await sendMessageFiltered(bot.telegram, chat_id, "Preset value changed successfully!");
 
     setTimeout(() => {
-      bot.deleteMessage(chat_id, sentSuccessMsg.message_id);
+      bot.deleteMessage(chat_id, (sentSuccessMsg as any)?.message_id);
     }, 3000);
 
     setTimeout(() => {
@@ -666,7 +581,8 @@ export const changeGasFeeHandler = async (
     },
   ];
 
-  bot.sendMessage(chat_id, `Gas fee set to ${nextFeeOption}.`);
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  await sendMessageFiltered(bot.telegram, chat_id, `Gas fee set to ${nextFeeOption}.`);
 
   await bot.editMessageReplyMarkup(
     {
@@ -689,12 +605,8 @@ export const setCustomFeeScreenHandler = async (
     const user = await UserService.findOne({ username });
     if (!user) return;
 
-    const sentMessage = await bot.sendMessage(chat_id, SET_GAS_FEE, {
-      parse_mode: "HTML",
-      reply_markup: {
-        force_reply: true,
-      },
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, SET_GAS_FEE, { parse_mode: "HTML", reply_markup: { force_reply: true } });
 
     await MsgLogService.create({
       username,
@@ -759,7 +671,8 @@ export const setCustomFeeHandler = async (
       auto_buy,
       auto_buy_amount
     );
-    bot.sendMessage(chat_id, `Gas fee set to ${amount} SOL.`);
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  await sendMessageFiltered(bot.telegram, chat_id, `Gas fee set to ${amount} SOL.`);
 
     await bot.editMessageReplyMarkup(reply_markup, {
       message_id: parent_msgid,
@@ -789,10 +702,8 @@ export const setCustomAutoBuyAmountHandler = async (
       return;
     }
     await UserService.updateMany({ username }, { auto_buy_amount: amount });
-    const sentSuccessMsg = await bot.sendMessage(
-      chat_id,
-      "AutoBuy amount changed successfully!"
-    );
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentSuccessMsg = await sendMessageFiltered(bot.telegram, chat_id, "AutoBuy amount changed successfully!");
 
     const key = "autobuy_amount" + username;
     const replaceId = (await redisClient.get(key)) ?? "0";
@@ -818,7 +729,8 @@ export const switchBurnOptsHandler = async (
 ) => {
   try {
     const message_id = msg.message_id;
-    const sentMessage = await bot.sendMessage(msg.chat.id, "Updating...");
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, msg.chat.id, "Updating...");
 
     const username = msg.chat.username;
     if (!username) {
@@ -841,7 +753,7 @@ export const switchBurnOptsHandler = async (
       const caption =
         `Burn: On 🔥\n\n` +
         `GrowTrade's burn functionality operates seamlessly through its fee system, where a portion of tokens bought and sold is systematically burned. This process does not affect users' own tokens but only those acquired through the fee mechanism, ensuring the safety of your trades.`;
-      bot.sendMessage(msg.chat.id, caption, closeReplyMarkup);
+      await sendMessageFiltered(bot.telegram, msg.chat.id, caption, closeReplyMarkup);
     }
     const reply_markup = {
       inline_keyboard: welcomeKeyboardList.map((rowItem) =>
@@ -890,7 +802,8 @@ export const switchAutoBuyOptsHandler = async (
 ) => {
   try {
     const message_id = msg.message_id;
-    const sentMessage = await bot.sendMessage(msg.chat.id, "Updating...");
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, msg.chat.id, "Updating...");
 
     const username = msg.chat.username;
     if (!username) {
@@ -1098,7 +1011,8 @@ export const changeJitoTipFeeHandler = async (
     },
   ];
 
-  bot.sendMessage(chat_id, `MEV protect set to ${nextFeeOption}.`);
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  await sendMessageFiltered(bot.telegram, chat_id, `MEV protect set to ${nextFeeOption}.`);
 
   await bot.editMessageReplyMarkup(
     {
@@ -1121,12 +1035,8 @@ export const setCustomJitoFeeScreenHandler = async (
     const user = await UserService.findOne({ username });
     if (!user) return;
 
-    const sentMessage = await bot.sendMessage(chat_id, SET_JITO_FEE, {
-      parse_mode: "HTML",
-      reply_markup: {
-        force_reply: true,
-      },
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, SET_JITO_FEE, { parse_mode: "HTML", reply_markup: { force_reply: true } });
 
     await MsgLogService.create({
       username,
@@ -1190,7 +1100,8 @@ export const setCustomJitoFeeHandler = async (
       auto_buy,
       auto_buy_amount
     );
-    bot.sendMessage(chat_id, `MEV protect set to ${amount} SOL.`);
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  await sendMessageFiltered(bot.telegram, chat_id, `MEV protect set to ${amount} SOL.`);
 
     await bot.editMessageReplyMarkup(reply_markup, {
       message_id: parent_msgid,
@@ -1210,13 +1121,8 @@ export const pnlCardHandler = async (
     const username = msg.chat.username;
     if (!username) return;
 
-    const pendingTxMsg = await bot.sendMessage(
-      chat_id,
-      `🕒 <b>Generating PNL Card...</b>\n`,
-      {
-        parse_mode: "HTML",
-      }
-    );
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const pendingTxMsg = await sendMessageFiltered(bot.telegram, chat_id, `🕒 <b>Generating PNL Card...</b>\n`, { parse_mode: "HTML" });
 
     const user = await UserService.findOne({ username });
     if (!user) {
@@ -1338,10 +1244,8 @@ export const pnlCardHandler = async (
     };
     const { pnlUrl } = await pnlService.getPNLCard(req);
     console.log(req);
-    await bot.deleteMessage(msg.chat.id, pendingTxMsg.message_id);
-    await bot.sendPhoto(msg.chat.id, pnlUrl, {
-      parse_mode: "HTML",
-    });
+  try { await bot.deleteMessage(msg.chat.id, (pendingTxMsg as any)?.message_id); } catch(e){}
+  try { await bot.sendPhoto(msg.chat.id, pnlUrl, { parse_mode: "HTML" }); } catch(e){}
   } catch (e) {
     console.log("~ refresh handler ~", e);
   }

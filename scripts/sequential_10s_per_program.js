@@ -50,6 +50,29 @@ let MINIMAL_OUTPUT = String(process.env.LISTENER_MINIMAL_OUTPUT || '').toLowerCa
 // runtime overrides; always treat collector output as explicit-created only.
 const ONLY_PRINT_EXPLICIT = true;
 
+// Save original console methods and optionally mute global logging when in explicit/minimal mode.
+const _origLog = console.log.bind(console);
+const _origError = console.error.bind(console);
+const _origWarn = console.warn.bind(console);
+// When explicit-only or minimal output requested, mute console.* globally to suppress noise
+if (ONLY_PRINT_EXPLICIT || MINIMAL_OUTPUT) {
+  console.log = (..._args) => {};
+  console.error = (..._args) => {};
+  console.warn = (..._args) => {};
+}
+
+// Helper to emit exactly the two-line canonical output: first an array of mints, then a JSON metadata object.
+function emitCanonicalLines(arr, metadata) {
+  try {
+    // Use the original logger to bypass global suppression
+    _origLog(JSON.stringify(arr));
+    _origLog(JSON.stringify(metadata));
+  } catch (e) {
+    try { _origLog(JSON.stringify(arr)); } catch (_) {}
+    try { _origLog(JSON.stringify(metadata)); } catch (_) {}
+  }
+}
+
 const PROGRAMS = [
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
@@ -549,20 +572,24 @@ async function startSequentialListener(options){
               }catch(e){}
             }
             // Print up to 2 newest discovered fresh mints immediately to terminal with color
+            // Track whether we've already emitted the canonical JSONL payload for this signature
+            let __printedCanonicalPayloadForSig = false;
             try{
               if(Array.isArray(fresh) && fresh.length>0){
                   const latest = fresh.slice(0,2);
                   // If ONLY_PRINT_EXPLICIT is set, require explicit creation for printing; otherwise behave as before
                   const shouldPrintArray = !ONLY_PRINT_EXPLICIT || latest.some(m => isMintCreatedInThisTx(tx, m));
                   if(shouldPrintArray){
-                    if(!MINIMAL_OUTPUT && !ONLY_PRINT_EXPLICIT) console.log(`FRESH_MINTS [program=${p}] [sig=${sig}] [kind=${kind}]`);
+                    // Build canonical metadata object matching the requested shape
+                    const metadata = { time:new Date().toISOString(), program: p, signature: sig, kind: kind, freshMints: latest.slice(0, Math.max(0, latest.length)), sampleLogs: (tx.meta&&tx.meta.logMessages||[]).slice(0,6) };
                     try{
-                      if(MINIMAL_OUTPUT) {
-                        console.log(JSON.stringify(latest));
-                      } else {
-                        console.log('\x1b[33m%s\x1b[0m', JSON.stringify(latest, null, 2));
-                      }
-                    }catch(e){ if(MINIMAL_OUTPUT) { console.log(JSON.stringify(latest)); } else { console.log('\x1b[33m%s\x1b[0m', String(latest)); } }
+                      // Emit exactly the two canonical JSON lines via helper
+                      emitCanonicalLines(latest, metadata);
+                      __printedCanonicalPayloadForSig = true;
+                    }catch(e){
+                      try{ emitCanonicalLines(latest, metadata); }catch(_){ }
+                      __printedCanonicalPayloadForSig = true;
+                    }
                   }
                 }
             }catch(e){}
@@ -593,15 +620,18 @@ async function startSequentialListener(options){
               // No optional raw enrichment (PRINT_RAW_FRESH removed) — keep events lightweight
               // Print full JSON payload only when we have strict explicit evidence or when not in ONLY_PRINT_EXPLICIT mode.
             try{
-              const anyExplicit = Array.isArray(globalEvent.sampleLogs) && globalEvent.sampleLogs.join('\n').toLowerCase().match(/initializemint|initialize mint|initialize_mint|instruction:\s*create/);
-              // Ensure parsed instruction also references the mint(s) when ONLY_PRINT_EXPLICIT is active
-              let parsedRefers = false;
-              if(Array.isArray(globalEvent.freshMints) && globalEvent.freshMints.length>0){
-                const txObj = tx;
-                for(const fm of globalEvent.freshMints){ if(isMintCreatedInThisTx(txObj, fm)) { parsedRefers = true; break; } }
+              // Avoid duplicate printing when we've already emitted the canonical payload above
+              if(!__printedCanonicalPayloadForSig){
+                const anyExplicit = Array.isArray(globalEvent.sampleLogs) && globalEvent.sampleLogs.join('\n').toLowerCase().match(/initializemint|initialize mint|initialize_mint|instruction:\s*create/);
+                // Ensure parsed instruction also references the mint(s) when ONLY_PRINT_EXPLICIT is active
+                let parsedRefers = false;
+                if(Array.isArray(globalEvent.freshMints) && globalEvent.freshMints.length>0){
+                  const txObj = tx;
+                  for(const fm of globalEvent.freshMints){ if(isMintCreatedInThisTx(txObj, fm)) { parsedRefers = true; break; } }
+                }
+                const shouldPrintGlobal = (!ONLY_PRINT_EXPLICIT) || (anyExplicit && parsedRefers);
+                if(shouldPrintGlobal){ console.log(JSON.stringify(globalEvent)); }
               }
-              const shouldPrintGlobal = (!ONLY_PRINT_EXPLICIT) || (anyExplicit && parsedRefers);
-              if(shouldPrintGlobal){ console.log(JSON.stringify(globalEvent)); }
             }catch(e){}
             // If capture-only mode is enabled, write a tiny capture file and skip enrichment
             if(CAPTURE_ONLY){
@@ -629,7 +659,11 @@ async function startSequentialListener(options){
                 try{
                   // In minimal mode avoid verbose label around collected final and only print the JSON object
                   if(MINIMAL_OUTPUT){
-                    if(!ONLY_PRINT_EXPLICIT) console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() }));
+                    // Emit canonical two-line JSONL using helper
+                    try{
+                      const arr = LATEST_COLLECTED.slice(0, COLLECT_MAX);
+                      emitCanonicalLines(arr, { collected: arr, time: new Date().toISOString() });
+                    }catch(e){ /* suppressed */ }
                   } else {
                     if(!ONLY_PRINT_EXPLICIT) console.error('COLLECTED_FINAL', JSON.stringify(LATEST_COLLECTED.slice(0, COLLECT_MAX)));
                     if(!ONLY_PRINT_EXPLICIT) console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() }));
@@ -863,7 +897,7 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
   const seenMintsLocal = new Set();
   const stopAt = Date.now() + (Number(timeoutMs) || 20000);
   try{
-    for(const p of PROGRAMS){
+  for(const p of PROGRAMS){
       if(Date.now() > stopAt) break;
       try{
     const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: SIG_BATCH_LIMIT }]);
@@ -988,7 +1022,8 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = (Number(process.e
         }
       }catch(e){}
       if(collected.length >= maxCollect) break;
-    }
+  }
+  try { const t = require('../src/utils/trace'); t.traceFlow('collector:collectFreshMints:finished',{ collectedCount: collected.length, sample: collected.slice(0,3).map(i=> (i && (i.mint||i.address||i.tokenAddress)) ) }); } catch(e){}
   }catch(e){}
   try{
     // If ONLY_PRINT_EXPLICIT is active, enforce that the collector returns only
@@ -1008,6 +1043,7 @@ async function collectFreshMintsPerUser(usersObj = {}, { maxCollect = 10, timeou
   try{ if(ONLY_PRINT_EXPLICIT) MINIMAL_OUTPUT = true; }catch(e){}
 
   try{ if(!MINIMAL_OUTPUT) console.error(`[LISTENER_DEBUG] collectFreshMintsPerUser starting collector for users=${Object.keys(usersObj||{}).length}`); }catch(e){}
+  try { const t = require('../src/utils/trace'); t.traceFlow('collector:collectFreshMintsPerUser:start',{ userCount: Object.keys(usersObj||{}).length, maxCollect, timeoutMs, strictOverride, ageOnly }); } catch(e){}
 
   // Build per-user desired counts from usersObj: prefer `strategy.requiredMints`,
   // fallback to `strategy.maxTrades`, then default to 3.

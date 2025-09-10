@@ -3,6 +3,7 @@
  */
 import { writeJsonFile } from './helpers';
 import { extractTradeMeta } from '../utils/tradeMeta';
+import { allowEnrichment } from '../utils/collectorGuard';
 import { unifiedBuy, unifiedSell } from '../tradeSources';
 import fs from 'fs';
 const fsp = fs.promises;
@@ -270,6 +271,7 @@ export async function executeBatchTradesForUser(user: any, tokens: any[], mode: 
 import type { Strategy } from './types';
 import { HELIUS_BATCH_SIZE, HELIUS_BATCH_DELAY_MS, ONCHAIN_FRESHNESS_TIMEOUT_MS } from '../config';
 import { autoFilterTokensVerbose } from '../utils/tokenUtils';
+import traceFlow from '../utils/trace';
 
 // Enrichment metrics for selective enrichment
 const __strategy_enrich_metrics: { attempts: number; successes: number; failures: number; enrichedTokens: number } = { attempts: 0, successes: 0, failures: 0, enrichedTokens: 0 };
@@ -320,6 +322,7 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
       const looksLikeListener = tokens.length > 0 && tokens.every(t => t && (t.sourceProgram || t.sourceSignature || t.sourceCandidates || (t.sourceTags && Array.isArray(t.sourceTags) && t.sourceTags.some((s: string) => /helius|listener|ws|dexscreener/i.test(s) ))));
       if (looksLikeListener) {
         try { console.log('[filterTokensByStrategy] bypassing filter for listener-provided tokens (no numeric constraints)'); } catch(_) {}
+        try{ traceFlow('filterTokensByStrategy:bypass_listener', { tokens: tokens.length, strategySummary: { maxTrades: (strategy as any)?.maxTrades } }); }catch(e){}
         // Respect user's maxTrades when returning bypassed listener tokens.
         const maxTrades = strategy && (strategy as any).maxTrades ? Math.max(1, Number((strategy as any).maxTrades)) : undefined;
         return (typeof maxTrades === 'number') ? tokens.slice(0, maxTrades) : tokens.slice();
@@ -391,6 +394,7 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
           // Strict policy: always return the fastAccepted set (possibly empty) and do not
           // defer tokens lacking age info to full enrichment. This enforces minAge > 0
           // as a hard on-chain requirement.
+          try{ traceFlow('filterTokensByStrategy:fast_age_pass', { maxAgeSeconds, fastAccepted: fastAccepted.length, fastRejected: fastRejected.length }); }catch(e){}
           return res;
         }
       }
@@ -428,20 +432,30 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
           }
           tokens = localTokens;
           try { console.log('[filterTokensByStrategy] merged realtime sources; extraCandidates=', extras.length); } catch {}
+          try{ traceFlow('filterTokensByStrategy:merged_realtime_sources', { extras: extras.length, tokensAfterMerge: tokens.length }); }catch(e){}
         }
       } catch (e) {
         try { console.warn('[filterTokensByStrategy] failed to fetch realtime candidates', e && e.message ? e.message : e); } catch {}
       }
 
-      const enrichPromise = utils.enrichTokenTimestamps(tokens, {
-        batchSize: Number(HELIUS_BATCH_SIZE || 6),
-        delayMs: Number(HELIUS_BATCH_DELAY_MS || 300)
-      });
+      let enrichPromise: Promise<any> | null = null;
+      try {
+        if (allowEnrichment()) {
+          enrichPromise = utils.enrichTokenTimestamps(tokens, {
+            batchSize: Number(HELIUS_BATCH_SIZE || 6),
+            delayMs: Number(HELIUS_BATCH_DELAY_MS || 300)
+          });
+        } else {
+          // skip enrichment under collector-only policy
+          enrichPromise = Promise.resolve();
+        }
+      } catch (e) { enrichPromise = Promise.resolve(); }
       // Start enrichment in background (non-blocking) so filtering remains responsive.
       // Log outcome for diagnostics but do not block the caller.
       enrichPromise
         .then(() => { try { console.log('[filterTokensByStrategy] background enrichment completed'); } catch (_) {} })
         .catch((err: any) => { try { console.warn('[filterTokensByStrategy] background enrichment failed:', err && err.message ? err.message : err); } catch (_) {} });
+      try{ traceFlow('filterTokensByStrategy:enrichment_started', { batchSize: Number(HELIUS_BATCH_SIZE || 6) }); }catch(e){}
     } catch (e: any) {
       console.warn('[filterTokensByStrategy] enrichment failed or timed out:', e?.message || e);
     }
@@ -485,7 +499,17 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
                 continue;
               }
               // officialEnrich mutates the token in-place with poolOpenTimeMs, liquidity, volume, freshnessScore
-              await tu.officialEnrich(tokenObj, { amountUsd: Number(strategy.buyAmount) || undefined, timeoutMs });
+              try {
+                if (allowEnrichment()) {
+                  await tu.officialEnrich(tokenObj, { amountUsd: Number(strategy.buyAmount) || undefined, timeoutMs });
+                } else {
+                  // Collector-only policy active: skip heavy enrichment
+                  __strategy_enrich_metrics.failures++;
+                  continue;
+                }
+              } catch (e) {
+                throw e;
+              }
               // heuristics: consider enrichment successful if we obtained any of these fields
               if (tokenObj && (tokenObj.poolOpenTimeMs || tokenObj.liquidity || tokenObj.volume || tokenObj._canonicalAgeSeconds)) {
                 __strategy_enrich_metrics.successes++;

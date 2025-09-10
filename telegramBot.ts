@@ -10,6 +10,7 @@ import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades
 import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
 import { STRATEGY_FIELDS, notifyUsers, withTimeout, buildBulletedMessage } from './src/utils/tokenUtils';
 import { buildPreviewMessage } from './src/utils/tokenUtils';
+import traceFlow from './src/utils/trace';
 // Background enrich/queue disabled: listener-only operation per user requirement.
 import { registerBuySellHandlers } from './src/bot/buySellHandlers';
 import { normalizeStrategy } from './src/utils/strategyNormalizer';
@@ -91,8 +92,16 @@ try{
         if(!raw) return new Set();
         const arr = JSON.parse(raw);
         const s = new Set<string>();
+        // Only extract mints from collector entries that explicitly indicate an initialize event
         if(Array.isArray(arr)){
-          for(const o of arr){ try{ const a = (o && (o.mint || o.tokenAddress || o.address)); if(a) s.add(String(a)); }catch(e){} }
+          for(const o of arr){
+            try{
+              if(!o) continue;
+              if(o.kind && String(o.kind) === 'initialize' && Array.isArray(o.freshMints)){
+                for(const m of o.freshMints){ if(m) s.add(String(m)); }
+              }
+            }catch(e){}
+          }
         }
         return s;
       }catch(e){ return new Set(); }
@@ -118,8 +127,18 @@ try{
             const allowed = new Set<string>();
             try{
               const seq = require('./scripts/sequential_10s_per_program.js');
+              // Only allow addresses that the collector explicitly emitted as
+              // initialize events with a freshMints array. This prevents any other
+              // collector metadata or sources from leaking addresses into user messages.
               if(seq && Array.isArray(seq.LATEST_COLLECTED_OBJ) && seq.LATEST_COLLECTED_OBJ.length > 0){
-                for(const o of seq.LATEST_COLLECTED_OBJ){ try{ const a = (o && (o.mint || o.tokenAddress || o.address)); if(a) allowed.add(String(a)); }catch(e){} }
+                for(const o of seq.LATEST_COLLECTED_OBJ){
+                  try{
+                    if(!o) continue;
+                    if(o.kind && String(o.kind) === 'initialize' && Array.isArray(o.freshMints)){
+                      for(const m of o.freshMints){ if(m) allowed.add(String(m)); }
+                    }
+                  }catch(e){}
+                }
               }
             }catch(e){}
             // If collector snapshot is empty/unavailable try Redis (shared snapshot across processes)
@@ -167,6 +186,18 @@ let boughtTokens: Record<string, Set<string>> = {};
 const LAST_SHOWN_TOKENS: Record<string, any[]> = {};
 const restoreStates: Record<string, boolean> = {};
 let listenerStarted = false;
+// Operational safety: disable any UI-initiated fetches or direct address-displaying replies.
+// When true, handlers that would fetch tokens or show addresses will reply with a safe
+// informational message instead. This enforces the "listener-only explicit mints" policy.
+const DISABLE_UI_FETCHES = true;
+
+async function forbidUiAction(ctx: any, reason?: string) {
+  try{
+    const msg = '⚠️ ميزة معطلة: لا يمكن جلب النتائج أو عرض العناوين من خلال واجهة المستخدم. المصدر الوحيد المسموح به هو إشعارات المستمع الصريح (listener).';
+    if (ctx && typeof ctx.reply === 'function') await ctx.reply(msg);
+  }catch(e){}
+  return;
+}
 
 async function ensureListenerStarted() {
   try {
@@ -204,6 +235,7 @@ function userIsListenerOnly(user: any) {
 async function getTokensForUser(userId: string, strategy: Record<string, any> | undefined) {
   // Listener-only token source: always use the program-listener collector
   try {
+  traceFlow('getTokensForUser:start', { userId, strategySummary: { maxTrades: strategy?.maxTrades } });
     // Convert strategy.maxTrades -> maxCollect
     const maxCollect = Math.max(1, Number(strategy?.maxTrades || 3));
     // Convert strategy age to maxAgeSec (seconds). Prefer normalized field when available.
@@ -221,7 +253,7 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
         }
       }
     } catch (e) {}
-    // Require the sequential listener collector and use it as the sole source
+  // Require the sequential listener collector and use it as the sole source
     // of tokens. This avoids any external API or cache usage.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const seq = require('./scripts/sequential_10s_per_program.js');
@@ -230,29 +262,31 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
   // Do not pass per-user age into the centralized collector. Discover explicit mints first,
   // then apply per-user age filtering below. Force collector to run in explicit-only mode
   // so we don't receive non-explicit tokens.
-  let items = await seq.collectFreshMints({ maxCollect, strictOverride, onlyPrintExplicit: true }).catch(() => []);
+  let items = await seq.collectFreshMints({ maxCollect, strictOverride, onlyPrintExplicit: true }).catch((e: any) => { traceFlow('collector:collectFreshMints:error', { err: String(e) }); return []; });
+    traceFlow('collector:collected', { count: Array.isArray(items) ? items.length : 0, maxCollect, strictOverride });
     // Immediately normalize and enforce explicit-only tokens coming from collector
-    try{
+  try{
       const { normalizeTokenForDisplay } = require('./src/utils/tokenUtils');
       const { enforceExplicitTokens, isExplicitOnly } = require('./src/explicit');
       if (Array.isArray(items) && items.length) {
         items = items.map((t:any)=> normalizeTokenForDisplay(t));
-        try{ if (isExplicitOnly && isExplicitOnly()) items = enforceExplicitTokens(items); }catch(e){}
+    try{ if (isExplicitOnly && isExplicitOnly()) { items = enforceExplicitTokens(items); traceFlow('enforceExplicitTokens:applied', { before: items.length }); } }catch(e){ traceFlow('enforceExplicitTokens:error', { e: String(e) }); }
       }
     }catch(e){}
     // If the listener exposes a recent detailed snapshot, prefer objects from that snapshot
     // when they match the addresses the collector returned. This avoids losing createdHere/collectedAtMs
     // metadata when the collector returns simplified string addresses.
-    try{
+  try{
       const snap = seq && seq.LATEST_COLLECTED_OBJ;
       if(Array.isArray(snap) && snap.length && Array.isArray(items) && items.length){
         const want = new Set(items.map(i => (typeof i === 'string' ? i : (i.mint || i.tokenAddress || i.address))));
         const matched = snap.filter(o => o && want.has(o.mint || o.tokenAddress || o.address));
+    traceFlow('collector:snapshot_match', { snapCount: snap.length, wantCount: want.size, matched: matched.length });
         if(matched && matched.length) items = matched.slice(0, items.length);
       }
     }catch(e){}
     if (!Array.isArray(items) || items.length === 0) return [];
-    // Filter collector results: only include explicit-created mints when available
+  // Filter collector results: only include explicit-created mints when available
     const isCreatedHelper = seq && typeof seq.isMintCreatedInThisTx === 'function' ? seq.isMintCreatedInThisTx : null;
     const explicitOnlyFiltered = (items || []).filter((it: any) => {
       try{
@@ -266,6 +300,7 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
   return Boolean(it.createdHere === true);
       }catch(e){ return false; }
     });
+  traceFlow('collector:explicit_filtering', { initial: Array.isArray(items)?items.length:0, explicitOnlyFiltered: explicitOnlyFiltered.length });
   // Respect user's maxTrades (maxCollect) — slice to desired count
   const desiredCount = Math.max(1, Number(strategy?.maxTrades || 3));
   const tokens = (explicitOnlyFiltered || []).slice(0, desiredCount).map((it: any) => {
@@ -274,7 +309,7 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
       const addr = it.tokenAddress || it.address || it.mint || null;
       return Object.assign({ tokenAddress: addr, address: addr, mint: addr, sourceCandidates: true, __listenerCollected: true }, it);
     }).filter(Boolean);
-    // If user specified a minAge, enforce it strictly here (same semantics as listener)
+  // If user specified a minAge, enforce it strictly here (same semantics as listener)
     try{
       const parseDuration = require('./src/utils/tokenUtils').parseDuration;
       // prefer normalized maxAgeSec when available, otherwise parse legacy minAge
@@ -287,7 +322,7 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
         const parsed = ma !== undefined && ma !== null ? parseDuration(ma) : undefined;
         if (!isNaN(Number(parsed)) && parsed !== undefined && parsed !== null) maxAgeSeconds = Number(parsed);
       }
-      if (!isNaN(Number(maxAgeSeconds)) && maxAgeSeconds !== undefined && maxAgeSeconds !== null && Number(maxAgeSeconds) > 0) {
+  if (!isNaN(Number(maxAgeSeconds)) && maxAgeSeconds !== undefined && maxAgeSeconds !== null && Number(maxAgeSeconds) > 0) {
         const accepted = tokens.filter((t: any) => {
           try{
             // prefer collector capture-based age when available (ageSinceCaptureSec or collectedAtMs), then fallback to canonical/on-chain age
@@ -304,17 +339,20 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
                 if (!isNaN(ftMs) && ftMs > 0) ageSec = (Date.now() - ftMs) / 1000;
               }
             } catch (e) { ageSec = undefined; }
-            if (ageSec === undefined || isNaN(ageSec)) return false; // strict: require known on-chain age
+      if (ageSec === undefined || isNaN(ageSec)) return false; // strict: require known on-chain age
             // Accept tokens younger or equal to the max allowed age
             return ageSec <= Number(maxAgeSeconds);
           }catch(e){ return false; }
         });
+    traceFlow('collector:age_filter', { maxAgeSeconds, before: tokens.length, after: accepted.length });
         return accepted;
       }
     }catch(e){}
-    return tokens;
+  traceFlow('getTokensForUser:end', { returned: tokens.length });
+  return tokens;
   } catch (e) {
     console.error('[getTokensForUser] listener fetch failed:', e?.message || e);
+  traceFlow('getTokensForUser:error', { err: String(e) });
     return [];
   }
 }
@@ -328,19 +366,9 @@ bot.command('auto_execute', async (ctx) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
   console.log(`[auto_execute] User: ${userId}`);
-  if (!user || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('You must set a strategy first using /strategy');
-    return;
-  }
-  const now = Date.now();
-  const tokens = await getTokensForUser(userId, user.strategy);
-  await ctx.reply('Executing your strategy on matching tokens...');
-  try {
-    await autoExecuteStrategyForUser(user, tokens, 'buy');
-    await ctx.reply('Strategy executed successfully!');
-  } catch (e: any) {
-    await ctx.reply('Error during auto execution: ' + getErrorMessage(e));
-  }
+  // Disabled: UI-initiated execution and fetching tokens is not allowed.
+  await forbidUiAction(ctx, 'auto_execute');
+  return;
 });
 
 const mainReplyKeyboard = Markup.keyboard([
@@ -373,24 +401,13 @@ bot.hears('💼 Wallet', async (ctx) => {
   const user = users[userId];
   console.log(`[💼 Wallet] User: ${userId}`);
   if (user && hasWallet(user)) {
-    const { getSolBalance } = await import('./src/getSolBalance');
-    let balance = 0;
-    try {
-      balance = await getSolBalance(user.wallet);
-    } catch {}
-    await ctx.reply(
-    `💼 Your Wallet:\nAddress: <code>${user.wallet}</code>\nBalance: <b>${balance}</b> SOL`,
-      ({
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [ { text: '👁️ Show Private Key', callback_data: 'show_secret' } ]
-          ]
-        }
-      } as any)
-    );
+    // Do not reveal addresses or perform on-chain balance fetches from UI.
+    // Provide a safe informational response and point users to the listener-driven flows.
+    await forbidUiAction(ctx, 'wallet:view');
+    return;
   } else {
-    await ctx.reply('❌ No wallet found for this user.', walletKeyboard());
+    await forbidUiAction(ctx, 'wallet:none');
+    return;
   }
 });
 
@@ -417,73 +434,9 @@ bot.hears('⚙️ Strategy', async (ctx) => {
 
 bot.hears('📊 Show Tokens', async (ctx) => {
   console.log(`[📊 Show Tokens] User: ${String(ctx.from?.id)}`);
-  // Use the sequential listener's per-user collector to return an authoritative merged payload.
-  try {
-  // Ensure the background listener is running (lazy start on first demand)
-  try { await ensureListenerStarted(); } catch (e) { /* ignore */ }
-    const userId = String(ctx.from?.id);
-    const user = users[userId] || {};
-  // Determine effective age-only mode: per-user override or global default
-  const ageOnlyMode = (user && user.strategy && (user.strategy as any).ageOnly !== undefined) ? Boolean((user.strategy as any).ageOnly) : GLOBAL_AGE_ONLY_DEFAULT;
-    // Build options for collector from user's strategy
-    const maxCollect = Math.max(1, Number(user.strategy?.maxTrades || 3));
-    const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-    // Require the sequential listener module and its per-user helper
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const seq = require('./scripts/sequential_10s_per_program.js');
-    if (!seq || typeof seq.collectFreshMintsPerUser !== 'function') {
-      await ctx.reply('⚠️ Live listener not available right now; please try again later.');
-      return;
-    }
-    // Run a single collection pass and get the merged payload for this user only
-    const usersObj: Record<string, any> = {};
-    usersObj[userId] = user;
-  const collected = await seq.collectFreshMintsPerUser(usersObj, { maxCollect, timeoutMs: Number(process.env.COLLECT_TIMEOUT_MS || 20000), strictOverride, ageOnly: ageOnlyMode, onlyPrintExplicit: true }).catch(() => ({}));
-    // Normalize and enforce explicit tokens immediately after collection
-    try{
-      const { normalizeTokenForDisplay } = require('./src/utils/tokenUtils');
-      const { enforceExplicitTokens, isExplicitOnly } = require('./src/explicit');
-      if(collected && collected[userId] && Array.isArray(collected[userId].tokens)){
-        let toks = collected[userId].tokens.map((t:any)=> normalizeTokenForDisplay(t));
-        try{ if(isExplicitOnly && isExplicitOnly()) toks = enforceExplicitTokens(toks); }catch(e){}
-        collected[userId].tokens = toks;
-      }
-    }catch(e){}
-    const payload = collected && collected[userId] ? collected[userId] : null;
-    if (!payload || !Array.isArray(payload.tokens) || payload.tokens.length === 0) {
-      await ctx.reply('No live tokens found right now. Try again in a few seconds.');
-      return;
-    }
-  // Only show tokens that the collector marked as createdHere (explicit-created)
-  const explicitTokens = (payload.tokens || []).filter((t:any) => t && t.createdHere === true);
-  if (!explicitTokens || explicitTokens.length === 0) {
-    await ctx.reply('No explicit-created live tokens found right now. Try again in a few seconds.');
-    return;
-  }
-  // Render the merged tokens payload (up to user's maxTrades) using the bulleted template
-  const tokens = explicitTokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
-  const { text, inline_keyboard } = buildBulletedMessage(tokens, { cluster: process.env.SOLANA_CLUSTER, title: 'Live tokens (listener)', maxShow: tokens.length });
-  // Log the bulleted message and keyboard for offline review/debugging before replying
-  try {
-    const tag = `[SHOW_TOKENS_MSG user=${userId}]`;
-    console.log(tag, text);
-    try { console.log(tag + ' inline_keyboard:', JSON.stringify(inline_keyboard, null, 2)); } catch (e) { console.log(tag + ' inline_keyboard (stringify failed)'); }
-  } catch (e) { /* ignore logging errors */ }
-  // Debug: canonical payload printing suppressed to reduce log noise.
-  try{
-    // Intentionally left blank: detailed token payload debug removed per request.
-  }catch(e){}
-  // Store the last explicitly shown tokens for this user so the dropdown can reference them
-  try{ LAST_SHOWN_TOKENS[String(userId)] = (tokens || []).map((t:any)=> ({ address: t.address || t.mint || t.tokenAddress, mint: t.mint, tokenAddress: t.tokenAddress, createdHere: t.createdHere })); }catch(e){}
-
-  // Inject a dropdown button row at the top that opens a callback to list explicit tokens
-  const dropdownRow = [{ text: 'Select explicit token', callback_data: 'list_tokens' }];
-  const markup = { inline_keyboard: [ dropdownRow, ...Array.isArray(inline_keyboard) ? inline_keyboard : [] ] };
-  await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup } as any));
-  } catch (e) {
-    console.error('[show_tokens] error', e && (e.message || e));
-    try { await ctx.reply('Error fetching live tokens.'); } catch(_){}
-  }
+  // Per policy: do not allow UI-initiated token fetches or direct token displays.
+  await forbidUiAction(ctx, 'show_tokens');
+  return;
 });
 
 bot.hears('🤝 Invite Friends', async (ctx) => {
@@ -537,29 +490,9 @@ bot.command('notify_tokens', async (ctx) => {
     await ctx.reply('❌ You must set a strategy first using /strategy');
     return;
   }
-  const now = Date.now();
-  const tokens = await getTokensForUser(userId, user.strategy);
-    let filteredTokens: any[] = [];
-    try {
-      if (ageOnlyMode) {
-        // Age-only mode: accept listener candidates and skip heavy filtering
-        filteredTokens = tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
-      } else if (userIsListenerOnly(user)) {
-        // Preserve the listener-provided candidates without background enrichment
-        filteredTokens = tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
-      } else {
-        filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy, { preserveSources: true }));
-      }
-    } catch (e) {
-      console.error('[notify_tokens] filtering failed:', e);
-      filteredTokens = [];
-    }
-  if (!filteredTokens.length) {
-    await ctx.reply('No tokens currently match your strategy.');
-    return;
-  }
-  await notifyUsers(ctx.telegram, { [userId]: user }, filteredTokens);
-  await ctx.reply('✅ Notification sent for tokens matching your strategy.');
+  // Do not allow UI to trigger a notification or to build/send token lists.
+  await forbidUiAction(ctx, 'notify_tokens');
+  return;
 });
 
 
@@ -608,7 +541,8 @@ bot.command(['create_wallet', 'restore_wallet'], async (ctx) => {
   user.secret = secret;
   user.wallet = keypair.publicKey?.toBase58?.() || keypair.publicKey;
   saveUsers(users);
-  await ctx.reply('✅ Wallet ' + (ctx.message.text.startsWith('/restore_wallet') ? 'restored' : 'created') + ' successfully!\nAddress: <code>' + user.wallet + '</code>\nPrivate key (keep it safe): <code>' + user.secret + '</code>', { parse_mode: 'HTML' });
+  // Do not display addresses or private keys in chat via UI flows.
+  await forbidUiAction(ctx, 'wallet:created');
 });
 
 
@@ -620,52 +554,37 @@ async function notifyAutoSell(user: any, sellOrder: any) {
     msg += `Token: ${sellOrder.token}\nAmount: ${sellOrder.amount}\nTarget price: ${sellOrder.targetPrice}\n`;
     msg += sellOrder.tx ? `Transaction: ${sellOrder.tx}\n` : '';
     msg += sellOrder.status === 'success' ? 'Executed successfully.' : 'Execution failed.';
-    await bot.telegram.sendMessage(chatId, msg);
+    // Use screen guard to prevent accidental address leaks from UI flows
+    try {
+      const { sendMessageFiltered } = await import('./src/bot/screenGuard');
+      const sent = await sendMessageFiltered(bot.telegram, chatId, msg, { parse_mode: 'HTML' });
+      if (!sent) {
+        console.warn('[notifyAutoSell] message suppressed by screenGuard for chatId=' + String(chatId));
+      }
+    } catch (e) {
+      // Do NOT fallback to direct send. Log the failure and move on.
+      console.warn('[notifyAutoSell] failed to send via screenGuard; message not sent; err=' + (e && (e.message || String(e))));
+    }
   } catch {}
 }
 
 setInterval(async () => {
   console.log(`[monitorAndAutoSellTrades] Interval triggered`);
+  if (DISABLE_UI_FETCHES || LISTENER_ONLY_MODE) {
+    // Monitoring and UI-initiated auto-sell notifications are disabled under listener-only policy.
+    return;
+  }
   if (!users || typeof users !== 'object') return;
   for (const userId in users) {
     if (!userId || userId === 'undefined') {
       console.warn('[monitorAndAutoSellTrades] Invalid userId, skipping.');
       continue;
     }
-  const user = users[userId];
-  const tokensForUser = await getTokensForUser(userId, user?.strategy);
-  await monitorAndAutoSellTrades(user, tokensForUser);
-    const sentTokensDir = process.cwd() + '/sent_tokens';
-    const userFile = `${sentTokensDir}/${userId}.json`;
-    try {
-      if (LISTENER_ONLY_MODE) {
-        // In listener-only mode avoid reading user sent_tokens files on disk.
-        // Assume in-memory/Redis suppression is handled elsewhere.
-      } else {
-        if (!(await fsp.stat(userFile).catch(() => false))) continue;
-      }
-    } catch {
-      continue;
-    }
-    let userTrades: any[] = [];
-    try {
-      if (!LISTENER_ONLY_MODE) {
-        const data = await fsp.readFile(userFile, 'utf8');
-        userTrades = JSON.parse(data || '[]');
-      } else {
-        userTrades = [];
-      }
-    } catch {}
-    const executed = userTrades.filter((t: any) => t.mode === 'sell' && t.status === 'success' && t.auto && !t.notified);
-    for (const sellOrder of executed) {
-      await notifyAutoSell(user, sellOrder);
-      (sellOrder as any).notified = true;
-    }
-    try {
-  if (!LISTENER_ONLY_MODE) await writeJsonFile(userFile, userTrades);
-    } catch (e) {
-      console.error('[monitorAndAutoSellTrades] Failed to write user trades for', userFile, e);
-    }
+    const user = users[userId];
+    try{
+      const tokensForUser = await getTokensForUser(userId, user?.strategy);
+      await monitorAndAutoSellTrades(user, tokensForUser);
+    }catch(e){ /* swallow per-user errors */ }
   }
 }, 5 * 60 * 1000);
 
@@ -689,7 +608,8 @@ bot.action('create_wallet', async (ctx) => {
   user.secret = secret;
   user.wallet = keypair.publicKey?.toBase58?.() || keypair.publicKey;
   saveUsers(users);
-  await ctx.reply(`✅ Wallet created successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key (keep it safe): <code>${user.secret}</code>`, ({ parse_mode: 'HTML' } as any));
+  // Do not display wallet or secret in chat; enforce listener-only/UI-safe mode
+  await forbidUiAction(ctx, 'wallet:created');
 });
 
 bot.action('restore_wallet', async (ctx) => {
@@ -714,8 +634,7 @@ bot.on('text', async (ctx, next) => {
       users[userId] = user;
       saveUsers(users);
       delete restoreStates[userId];
-
-  await ctx.reply(`✅ Wallet restored successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key stored securely.`, ({ parse_mode: 'HTML' } as any));
+  await forbidUiAction(ctx, 'wallet:restored');
     } catch {
       await ctx.reply('❌ Failed to restore wallet. Invalid key. Try again or create a new wallet.');
     }
@@ -806,20 +725,29 @@ bot.on('callback_query', async (ctx: any) => {
     if (data === 'list_tokens'){
       const toks = LAST_SHOWN_TOKENS[userId] || [];
       if(!Array.isArray(toks) || toks.length===0){ await ctx.answerCbQuery('No explicit tokens available', { show_alert: true }); return; }
-      // Build rows of buttons with callback_data select_token:<addr>
-      const rows = toks.map((t:any)=> [{ text: t.address || t.mint || t.tokenAddress || 'unknown', callback_data: `select_token:${t.address || t.mint || t.tokenAddress}`}]);
+      // Build rows of buttons with masked text and a select_token callback carrying only an index
+      const rows = toks.map((t:any, idx:number)=>{
+        const a = t.address || t.mint || t.tokenAddress || 'unknown';
+        const masked = (typeof a === 'string' && a.length>8) ? (a.slice(0,4) + '...' + a.slice(-4)) : a;
+        return [{ text: masked, callback_data: `select_token_idx:${idx}`}];
+      });
       try{ await ctx.editMessageReplyMarkup({ inline_keyboard: rows }); }catch(e){ /* ignore */ }
       await ctx.answerCbQuery();
       return;
     }
     if (data.startsWith('select_token:')){
+      // Legacy select_token handler (should be replaced by index-based selection)
+      await ctx.answerCbQuery('Legacy selection not supported; please reopen the list and choose an item.', { show_alert: true });
+      return;
+    }
+    if (data.startsWith('select_token_idx:')){
       const parts = data.split(':');
-      const sel = parts.slice(1).join(':');
+      const idx = Number(parts[1]);
       const toks = LAST_SHOWN_TOKENS[userId] || [];
-      const found = (toks || []).find((t:any)=> (t.address === sel) || (t.mint === sel) || (t.tokenAddress === sel));
+      const found = (Array.isArray(toks) && toks[idx]) ? toks[idx] : null;
       if(!found){ await ctx.answerCbQuery('Token not found', { show_alert: true }); return; }
-      // reply with the explicit token address only
-      await ctx.reply(`Selected explicit token: <code>${found.address || found.mint || found.tokenAddress}</code>`, { parse_mode: 'HTML' });
+      // Acknowledge selection but do NOT send the raw address in chat. Provide a confirmation only.
+      await ctx.reply('Selected explicit token (confirmed). Use listener notifications for full details.');
       await ctx.answerCbQuery();
       return;
     }
@@ -862,6 +790,7 @@ console.log('--- About to launch bot ---');
           const guard = require('./src/bot/telegramGuard').sendNotificationIfExplicit;
           listenerNotifier.on('notification', async (userEvent:any) => {
             try{
+              traceFlow('notifier:event_received', { user: userEvent && userEvent.user, program: userEvent && userEvent.program, tokens: Array.isArray(userEvent.tokens)?userEvent.tokens.length:0 });
               const uid = String(userEvent && userEvent.user);
               if(!uid) return;
               const user = users[uid]; if(!user || !user.strategy || user.strategy.enabled === false) return;
@@ -874,6 +803,7 @@ console.log('--- About to launch bot ---');
               try { const { enforceExplicitTokens } = require('./src/explicit'); tokenObjs = enforceExplicitTokens(tokenObjs || []).slice(0, maxTrades); } catch(e){}
               // Log the incoming notification payload for debugging
               try { console.log(`[NOTIF_IN] user=${uid} program=${userEvent && userEvent.program} signature=${userEvent && userEvent.signature} tokens=${tokenObjs.length}`); } catch(e){}
+              traceFlow('notifier:after_prepare_tokens', { user: uid, payloadTokens: tokenObjs.length });
               // Debug dump: canonical fields for each token before building message/guard
               try{
                 const dbg = (tokenObjs || []).map((t:any)=>({ mint: t && (t.mint||t.tokenAddress||t.address), tokenAddress: t && t.tokenAddress, address: t && t.address, createdHere: t && t.createdHere, collectedAtMs: t && t.collectedAtMs }));
@@ -908,6 +838,7 @@ console.log('--- About to launch bot ---');
                 // Use guard to enforce explicit-only before any send
                 try{
                   const sent = await guard(bot.telegram, chatId, { html, inlineKeyboard, tokenObjs, userEvent, fallbackText: `ℹ️ Notification suppressed: only explicit-created tokens are allowed.` });
+                  traceFlow('notifier:guard_result', { user: uid, sent: Boolean(sent) });
                   if(!sent) {
                     // nothing sent (suppressed or no payload)
                   }
@@ -1074,7 +1005,7 @@ bot.command('show_token', async (ctx) => {
   // If user requests age-only behavior, prefer the fast listener-produced candidates
   if (((user && user.strategy && (user.strategy as any).ageOnly !== undefined) ? Boolean((user.strategy as any).ageOnly) : GLOBAL_AGE_ONLY_DEFAULT) || !hasNumericConstraint) {
       // Fast path: return listener-produced candidates (or fastFetcher) without heavy enrichment
-      try { await ctx.reply('🔎 Fetching latest live mints from listener — fast preview...'); } catch(e){}
+  try { await ctx.reply('🔎 Fetching latest live mints from listener — fast preview...'); } catch(e){}
       // Try to use the sequential listener's one-shot collector when available.
       // If the listener module exists but returns no fresh mints, DO NOT fallback to DexScreener
       // to avoid showing older tokens — queue a background enrich instead and inform the user.
@@ -1097,7 +1028,7 @@ bot.command('show_token', async (ctx) => {
             const entry = collected && collected[userId] ? collected[userId] : null;
             let toks = (entry && Array.isArray(entry.tokens)) ? entry.tokens.map((it:any)=> Object.assign({ tokenAddress: it.mint || it.tokenAddress || it.address, address: it.mint || it.tokenAddress || it.address, mint: it.mint || it.tokenAddress || it.address, sourceCandidates: true, __listenerCollected: true }, it)) : [];
             toks = toks.map((t:any)=> normalizeTokenForDisplay(t));
-            try{ if(isExplicitOnly && isExplicitOnly()) toks = enforceExplicitTokens(toks); }catch(e){}
+            try{ if(isExplicitOnly && isExplicitOnly()) { toks = enforceExplicitTokens(toks); traceFlow('show_token:fastpath:enforced_explicit', { userId, count: toks.length }); } }catch(e){ traceFlow('show_token:fastpath:enforce_error', { e: String(e) }); }
             tokens = toks.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
           }catch(e){
             const entry = collected && collected[userId] ? collected[userId] : null;
@@ -1105,21 +1036,24 @@ bot.command('show_token', async (ctx) => {
           }
         }
       }catch(e){ listenerAvailable = false; }
-      if(listenerAvailable){
+      traceFlow('show_token:fastpath:listenerAvailable', { userId, listenerAvailable, tokensFound: Array.isArray(tokens)?tokens.length:0 });
+          if(listenerAvailable){
         if(!tokens || tokens.length===0){
           // Per listener-only mode, do not enqueue external enrich jobs. Inform the user to wait for listener events.
           await ctx.reply('🔔 لا توجد نتائج مستمع حديثة الآن؛ يرجى الانتظار بينما يستمر مصدر الاستماع بجمع النتائج.');
           return;
-        }
+  }
       } else {
         // Listener not available: per requirement do NOT fallback to external fetchers or caches.
-        await ctx.reply('⚠️ مستمع البرامج غير متاح حالياً؛ لا يمكن جلب البيانات من مصادر خارجية وفق سياسة التشغيل. برجاء التأكد من تشغيل مصدر الاستماع أو حاول لاحقاً.');
+  traceFlow('show_token:fastpath:listener_unavailable', { userId });
+  await ctx.reply('⚠️ مستمع البرامج غير متاح حالياً؛ لا يمكن جلب البيانات من مصادر خارجية وفق سياسة التشغيل. برجاء التأكد من تشغيل مصدر الاستماع أو حاول لاحقاً.');
         return;
       }
       console.log('[show_token] fast-path tokens:', (tokens || []).length);
       // If these tokens are live candidates (from listener/fastFetcher), present immediately
-      if (Array.isArray(tokens) && tokens.length && tokens.every(t => (t as any).sourceCandidates || (t as any).matched || (t as any).tokenAddress)) {
+  if (Array.isArray(tokens) && tokens.length && tokens.every(t => (t as any).sourceCandidates || (t as any).matched || (t as any).tokenAddress)) {
         console.log('[show_token] presenting live/sourceCandidates without heavy filter');
+  traceFlow('show_token:fastpath:presenting_live', { userId, tokens: tokens.length });
         // debug: print token provenance & freshness hints
         try{
           for(const t of tokens){
@@ -1151,23 +1085,25 @@ bot.command('show_token', async (ctx) => {
           msg += `\n<code>${addr}</code>\n`;
         }
       }
-      try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch (e) { try { await ctx.reply('✅ Found live matching tokens.'); } catch {} }
+  try { await ctx.reply('✅ Found live matching tokens (use listener notifications to receive explicit-created tokens).'); } catch (e) { try { await ctx.reply('✅ Found live matching tokens.'); } catch {} }
       return;
     }
 
     // Deep, accurate check path: fetch user-tailored tokens (may include on-chain enrichment) and apply strategy filter
     // If the user prefers listener-only/no-enrich, skip heavy enrichment and present listener candidates
     if (userIsListenerOnly(user)) {
-      try { await ctx.reply('🔎 You are in listener-only mode (no enrichment). Presenting live listener candidates...'); } catch(e){}
+  traceFlow('show_token:listener_only_branch', { userId });
+  try { await ctx.reply('🔎 You are in listener-only mode (no enrichment). Presenting live listener candidates...'); } catch(e){}
       const tokens = await getTokensForUser(userId, user.strategy);
       if (tokens && tokens.length) {
+  traceFlow('show_token:listener_only_tokens', { userId, tokens: tokens.length });
         const maxTrades = Math.max(1, Number(user.strategy?.maxTrades || 3));
         const maxShow = Math.min(maxTrades, 10, tokens.length);
         let msg = `✅ Live listener-only results: <b>${tokens.length}</b> token(s) available (showing up to ${maxShow}):\n`;
         for (const t of tokens.slice(0, maxShow)) {
     try { const preview = buildPreviewMessage(t); const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`; try{ if(t && (t.sourceProgram || t.sourceSignature)) msg += `<i>من البرنامج: ${t.sourceProgram || '-'} sig: ${t.sourceSignature || '-'}</i>\n`; }catch(e){} } catch (e) { const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<code>${addr}</code>\n`; }
         }
-        try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch(e) { try { await ctx.reply('✅ Found live listener-only tokens.'); } catch(_){} }
+  try { await ctx.reply('✅ Found live listener-only tokens (use listener notifications to receive explicit-created tokens).'); } catch(e) { try { await ctx.reply('✅ Found live listener-only tokens.'); } catch(_){} }
         return;
       }
       // If no tokens from getTokensForUser, try collector one-shot raw addresses as a last resort
@@ -1199,11 +1135,13 @@ bot.command('show_token', async (ctx) => {
     }
 
     // perform accurate filtering for non-listener-only users
+      traceFlow('show_token:accurate_branch', { userId });
     await ctx.reply('🔎 Performing an accurate strategy check — this may take a few seconds. Please wait...');
     const tokens = await getTokensForUser(userId, user.strategy);
     let accurate: any[] = [];
     try {
       accurate = await withTimeout(filterTokensByStrategy(tokens, user.strategy, { fastOnly: false }), 7000, 'show_token-filter');
+        traceFlow('show_token:accurate_result', { userId, tokensIn: Array.isArray(tokens)?tokens.length:0, accurate: Array.isArray(accurate)?accurate.length:0 });
     } catch (e) {
       console.error('[show_token] accurate filter failed or timed out', e?.message || e);
       accurate = [];

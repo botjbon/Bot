@@ -140,7 +140,8 @@ export const contractInfoScreenHandler = async (
       return;
     }
 
-    const pending = await bot.sendMessage(chat_id, "Loading...");
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  const pending = await sendMessageFiltered(bot.telegram, chat_id, "Loading...");
 
     let caption = "";
     let solbalance = 0;
@@ -182,7 +183,7 @@ export const contractInfoScreenHandler = async (
         await sendNoneExistTokenNotification(bot, msg);
         return;
       }
-      bot.deleteMessage(chat_id, pending.message_id);
+      try { bot.deleteMessage(chat_id, pending.message_id); } catch (e) {}
           const jupiterTradeable = await jupiterSerivce.checkTradableOnJupiter(mint.toString());
       solbalance = captionForPump.solbalance;
       splbalance = captionForPump.splbalance;
@@ -194,7 +195,7 @@ export const contractInfoScreenHandler = async (
         user.wallet_address
       );
       if (!captionForRaydium) {
-        bot.deleteMessage(chat_id, pending.message_id);
+        try { bot.deleteMessage(chat_id, pending.message_id); } catch (e) {}
         return;
       }
             const jupiterTradeable = await jupiterSerivce.checkTradableOnJupiter(mint.toString());
@@ -218,10 +219,10 @@ export const contractInfoScreenHandler = async (
       );
 
       if (!captionForJuipter) {
-        bot.deleteMessage(chat_id, pending.message_id);
-        return;
-      }
-      bot.deleteMessage(chat_id, pending.message_id);
+          try { bot.deleteMessage(chat_id, pending.message_id); } catch (e) {}
+          return;
+        }
+        try { bot.deleteMessage(chat_id, pending.message_id); } catch (e) {}
       caption = captionForJuipter.caption;
       solbalance = captionForJuipter.solbalance;
       splbalance = captionForJuipter.splbalance;
@@ -304,22 +305,7 @@ export const contractInfoScreenHandler = async (
         extra_key: switchBtn,
       });
     } else {
-      const sentMessage = await bot.sendMessage(chat_id, caption, {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: {
-          inline_keyboard: [...inline_keyboards].map((rowItem) =>
-            rowItem.map((item) => {
-              return {
-                text: item.text,
-                callback_data: JSON.stringify({
-                  command: item.command ?? "dummy_button",
-                }),
-              };
-            })
-          ),
-        },
-      });
+  const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, caption, { parse_mode: "HTML", disable_web_page_preview: true, reply_markup: { inline_keyboard: [...inline_keyboards].map((rowItem) => rowItem.map((item) => ({ text: item.text, callback_data: JSON.stringify({ command: item.command ?? "dummy_button" }) }))) } });
 
       await MsgLogService.create({
         username,

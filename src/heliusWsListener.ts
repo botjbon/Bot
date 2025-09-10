@@ -145,6 +145,7 @@ async function httpGetWithRetry(url: string, opts: any = {}) {
 async function retryOfficialEnrich(tuMod: any, tokenObj: any, opts: { timeoutMs?: number } = {}) {
   try {
   if (LISTENER_ONLY_MODE) return null;
+    try { const cg = await import('./utils/collectorGuard'); if (!cg || !cg.allowEnrichment || !cg.allowEnrichment()) return null; } catch (e) {}
     const maxAttempts = Number(process.env.HELIUS_OFFICIAL_ENRICH_RETRY_COUNT ?? 3);
     const baseMs = Number(process.env.HELIUS_OFFICIAL_ENRICH_RETRY_BASE_MS ?? 300);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -439,8 +440,9 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
       // Single onMessage callback
       try { options?.onMessage && options.onMessage(parsed); } catch (e) {}
       try {
-        const evt = analyzeHeliusMessage(parsed);
+  const evt = analyzeHeliusMessage(parsed);
         if (!evt) return;
+  try { const tmod = await import('./utils/trace'); tmod.traceFlow('heliusWsListener:event_received',{ mint: evt.mint || null, kind: evt.eventType || null, rawSummary: !!(parsed && parsed.params && parsed.params.result && parsed.params.result.value), signature: parsed?.params?.result?.value?.signature ?? parsed?.result?.value?.signature ?? null }); } catch(e){}
         // attach protocol-rule match if available
         try {
           const rules = PROTOCOL_RULES && PROTOCOL_RULES._map ? PROTOCOL_RULES._map : null;
@@ -811,6 +813,7 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
               const mgrMod = require('./heliusEnrichmentQueue');
               const mgr = (mgrMod && mgrMod._manager) || (mgrMod && mgrMod.createEnrichmentManager && (mgrMod._manager = mgrMod.createEnrichmentManager({ ttlSeconds: 300, maxConcurrent: 3 })));
               const p = mgr.enqueue(evt, hf);
+              try { const tmod = await import('./utils/trace'); tmod.traceFlow('heliusWsListener:enrichment_enqueued',{ mint: evt.mint || null, handler: hf ? 'fastTokenFetcher.handleNewMintEvent' : 'none' }); } catch(e){}
               // best-effort background stats update: update mint snapshot volumes/eventCount (non-blocking)
               try {
                 const ftf = require('./fastTokenFetcher');

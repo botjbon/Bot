@@ -62,18 +62,18 @@ async function executeCopyTrade(user: TrackerUser, trade: {token: string; amount
   }
 }
 
-// Helper: Notify user via Telegram bot
-function notifyUser(userId: string, message: string) {
-  if (bot && bot.telegram && typeof bot.telegram.sendMessage === 'function') {
+// Helper: Notify user via Telegram bot through guard
+async function notifyUser(userId: string, message: string) {
+  if (!(bot && bot.telegram && typeof bot.telegram.sendMessage === 'function')) return;
+  try {
+    const { default: sendNotificationIfExplicit } = await import('../bot/telegramGuard');
     const onlyExplicit = (process.env.ONLY_PRINT_EXPLICIT === 'true' || process.env.ONLY_PRINT_EXPLICIT === '1');
     if (onlyExplicit) {
-      // Do not send copy-trade notifications as discovery messages when explicit-only is enforced.
-      // Send a minimal informational stub instead.
-      try { bot.telegram.sendMessage(userId, 'ℹ️ Copy-trade notifications suppressed due to explicit-only policy.'); } catch (e) {}
+      await sendNotificationIfExplicit(bot, userId, { fallbackText: 'ℹ️ Copy-trade notifications suppressed due to explicit-only policy.' });
       return;
     }
-    bot.telegram.sendMessage(userId, message);
-  }
+    await sendNotificationIfExplicit(bot, userId, { fallbackText: message });
+  } catch (e) {}
 }
 
 // Main monitoring logic

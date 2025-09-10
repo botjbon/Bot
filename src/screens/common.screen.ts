@@ -33,11 +33,8 @@ export const sendNoneUserNotification = async (
   msg: TelegramMessage
 ) => {
   const { id: chat_id } = msg.chat;
-  const sentMsg = await bot.sendMessage(
-    chat_id,
-    "⚠︎ Error\n<b>This account does not exist. Please contact support team.</b>",
-    closeReplyMarkup
-  );
+    const { sendMessageFiltered } = await import('../bot/screenGuard');
+    const sentMsg = await sendMessageFiltered(bot.telegram, chat_id, "⚠︎ Error\n<b>This account does not exist. Please contact support team.</b>", closeReplyMarkup);
   deleteDelayMessage(bot, chat_id, sentMsg.message_id, 5000);
 };
 
@@ -46,13 +43,8 @@ export const sendNoneExistTokenNotification = async (
   msg: TelegramMessage
 ) => {
   const { id: chat_id } = msg.chat;
-  const sentMsg = await bot.sendMessage(
-    chat_id,
-    "⚠︎ Error\n<b>This token does not exist. Please verify the mint address again or try later.</b>",
-    {
-      parse_mode: "HTML",
-    }
-  );
+    const { sendMessageFiltered } = await import('../bot/screenGuard');
+    const sentMsg = await sendMessageFiltered(bot.telegram, chat_id, "⚠︎ Error\n<b>This token does not exist. Please verify the mint address again or try later.</b>", { parse_mode: "HTML" });
   deleteDelayMessage(bot, chat_id, sentMsg.message_id, 5000);
 };
 
@@ -61,13 +53,8 @@ export const sendInsufficientNotification = async (
   msg: TelegramMessage
 ) => {
   const { id: chat_id } = msg.chat;
-  const sentMsg = await bot.sendMessage(
-    chat_id,
-    "⚠︎ Error\n<b>Insufficient amount.</b>",
-    {
-      parse_mode: "HTML",
-    }
-  );
+    const { sendMessageFiltered } = await import('../bot/screenGuard');
+    const sentMsg = await sendMessageFiltered(bot.telegram, chat_id, "⚠︎ Error\n<b>Insufficient amount.</b>", { parse_mode: "HTML" });
   deleteDelayMessage(bot, chat_id, sentMsg.message_id, 5000);
 };
 
@@ -76,11 +63,8 @@ export const sendUsernameRequiredNotification = async (
   msg: TelegramMessage
 ) => {
   const { id: chat_id } = msg.chat;
-  const sentMsg = await bot.sendMessage(
-    chat_id,
-    "⚠︎ Error\n<b>You have no telegram username yourself. Please edit your profile and try it again.</b>",
-    closeReplyMarkup
-  );
+    const { sendMessageFiltered } = await import('../bot/screenGuard');
+    const sentMsg = await sendMessageFiltered(bot.telegram, chat_id, "⚠︎ Error\n<b>You have no telegram username yourself. Please edit your profile and try it again.</b>", closeReplyMarkup);
 };
 
 // delay: ms

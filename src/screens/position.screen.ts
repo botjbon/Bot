@@ -89,11 +89,8 @@ export const positionScreenHandler = async (
         reply_markup,
       });
     } else {
-      const sentMessage = await bot.sendMessage(chat_id, temp, {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup,
-      });
+    const { sendMessageFiltered } = await import('../bot/screenGuard');
+    const sentMessage = await sendMessageFiltered(bot.telegram, chat_id, temp, { parse_mode: "HTML", disable_web_page_preview: true, reply_markup });
       replaceIdtemp = sentMessage.message_id;
     }
 

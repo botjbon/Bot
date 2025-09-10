@@ -33,10 +33,8 @@ export const openAlertBotDashboard = async (
     if (!username) return;
     const refdata = await get_referrer_info(username);
     if (!refdata) {
-      bot.sendMessage(
-        chat.id,
-        "You have no referral code. Please create a referral code first."
-      );
+      const { sendMessageFiltered } = await import('../bot/screenGuard');
+      await sendMessageFiltered(bot.telegram, chat.id, "You have no referral code. Please create a referral code first.");
       return;
     }
 
@@ -165,10 +163,8 @@ export const sendMsgForAlertScheduleHandler = async (
       inline_keyboard: inlineKeyboards,
     };
 
-    await bot.sendMessage(chat.id, msgText, {
-      reply_markup,
-      parse_mode: "HTML",
-    });
+  const { sendMessageFiltered } = await import('../bot/screenGuard');
+  await sendMessageFiltered(bot.telegram, chat.id, msgText, { reply_markup, parse_mode: "HTML" });
   } catch (e) {
     console.log("sendMsgForChannelIDHandler", e);
   }
@@ -198,9 +194,11 @@ export const updateSchedule = async (
       { schedule: scheduleTime }
     );
     if (res) {
-      bot.sendMessage(chatId, "Successfully updated!");
+      const { sendMessageFiltered } = await import('../bot/screenGuard');
+      await sendMessageFiltered(bot.telegram, chatId, "Successfully updated!");
     } else {
-      bot.sendMessage(chatId, "Update schedule failed! Try it again");
+      const { sendMessageFiltered } = await import('../bot/screenGuard');
+      await sendMessageFiltered(bot.telegram, chatId, "Update schedule failed! Try it again");
     }
   } catch (e) {
     console.log("updateSchedule", e);
